@@ -1,0 +1,16 @@
+node_modules/
+dist/
+dist-portable/
+src-tauri/target/
+src-tauri/gen/
+
+# 本地临时产物
+*.log
+*.tmp
+widget-check.png
+docs/media/_tmp/
+
+# 编辑器 / 系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini

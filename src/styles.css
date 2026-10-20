@@ -1,0 +1,333 @@
+@import "tailwindcss";
+
+/* Colour tokens. Components never carry a literal colour; everything reads
+   from here so the two themes stay in step. The root element carries
+   data-theme, resolved on the Rust side from the Windows app theme. */
+
+:root,
+html[data-theme="dark"] {
+  --codex-from: #3b82f6;
+  --codex-to: #58a6ff;
+  --codex-core: #a5d2ff;
+  --codex-glow: #58a6ff40;
+
+  --surface: #1b1b1beb;
+  --track: #ffffff14;
+  --border: #ffffff1a;
+  --text-primary: #faf9f5;
+  --text-secondary: #faf9f599;
+  --warn: #f5b84e;
+  --danger: #ef5350;
+  --sheen: rgba(255, 255, 255, 0.55);
+}
+
+html[data-theme="light"] {
+  --codex-from: #2563eb;
+  --codex-to: #3b82f6;
+  --codex-core: #8cb8f7;
+  --codex-glow: #3b82f626;
+
+  --surface: #f7f7f5eb;
+  --track: #00000012;
+  --border: #00000014;
+  --text-primary: #141413;
+  --text-secondary: #14141380;
+  --warn: #b07d22;
+  --danger: #c62828;
+  --sheen: rgba(255, 255, 255, 0.85);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  font-family: "Microsoft YaHei UI", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+* {
+  -webkit-user-drag: none;
+}
+
+.cx-shell {
+  height: 100vh;
+  width: 100vw;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-sizing: border-box;
+  display: flex;
+  overflow: hidden;
+  backdrop-filter: blur(14px);
+}
+
+/* A window refilling to full burns the surface rainbow for a quarter minute.
+   The class is added and removed by the interface; this only draws. */
+@keyframes cx-rainbow {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 400% 50%;
+  }
+}
+.cx-shell.cx-celebrate {
+  background-image: linear-gradient(
+    90deg,
+    #ff3b30,
+    #ff9500,
+    #ffcc00,
+    #34c759,
+    #00c7be,
+    #32ade6,
+    #af52de,
+    #ff2d55,
+    #ff3b30
+  );
+  background-size: 400% 100%;
+  animation: cx-rainbow 1.6s linear infinite;
+}
+
+/* The bar area needs an opaque, isolated backdrop. Without it the sweep's
+   screen blend mixes with the transparent window and disappears. */
+.cx-bars {
+  isolation: isolate;
+  background: var(--surface);
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 8px 8px 8px 2px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+/* The wrapper whose natural height the window is sized to. `.cx-bars` fills the
+   window, so it can never answer "how tall does this need to be". */
+.cx-content {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+}
+
+.cx-grip {
+  width: 6px;
+  flex: 0 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 140ms ease;
+  cursor: grab;
+}
+.cx-shell:hover .cx-grip {
+  opacity: 0.55;
+}
+.cx-grip:active {
+  cursor: grabbing;
+}
+.cx-grip-dots {
+  width: 2px;
+  height: 22px;
+  border-radius: 1px;
+  background: repeating-linear-gradient(
+    to bottom,
+    var(--text-secondary) 0 2px,
+    transparent 2px 4px
+  );
+}
+
+.cx-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Taskbar placement. The strip is around 48px tall, so each provider becomes a
+   narrow column with both windows stacked and the columns sit side by side. */
+
+.cx-shell[data-placement="taskbar"] {
+  border-radius: 6px;
+}
+
+.cx-shell[data-placement="taskbar"] .cx-bars {
+  padding: 3px 6px;
+}
+
+.cx-columns {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: 100%;
+}
+
+.cx-column {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.cx-column + .cx-column {
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
+.cx-column .cx-row {
+  gap: 3px;
+}
+
+.cx-column-empty {
+  flex-direction: row;
+  align-items: center;
+  gap: 5px;
+  font-size: 9px;
+  color: var(--text-secondary);
+}
+
+.cx-column-empty-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Row anatomy: mark, label, bar, percentage, countdown. */
+
+.cx-group + .cx-group {
+  margin-top: 6px;
+}
+
+.cx-row {
+  height: 15px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-secondary);
+}
+.cx-row + .cx-row {
+  margin-top: 2px;
+}
+
+.cx-logo {
+  flex: 0 0 10px;
+  width: 10px;
+  height: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cx-label {
+  /* Labels are short provider codes: 5h, 7d, 1M. */
+  flex: 0 0 16px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.cx-pct {
+  /* Fixed so the reset time below lines up with the one above, text left
+     against the bar. */
+  flex: 0 0 28px;
+  text-align: left;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.cx-est {
+  font-size: 7px;
+  vertical-align: super;
+  color: var(--text-secondary);
+  margin-left: 1px;
+  font-weight: 400;
+}
+
+.cx-countdown {
+  /* The two rows' reset times read as one column: the column sits tight to
+     the left against the percentages and centres its text inside itself. */
+  flex: 0 0 60px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.cx-warn {
+  color: var(--warn);
+}
+.cx-danger {
+  color: var(--danger);
+}
+
+.cx-track {
+  position: relative;
+  /* Half the width the bar used to take, then packed tight to the label so
+     the percentage follows straight after it. */
+  flex: 0 0 56px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.cx-column .cx-track {
+  flex: 0 0 44px;
+}
+
+.cx-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+}
+
+.cx-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 15px;
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.cx-status-strip {
+  border-radius: 4px;
+  padding: 0 6px;
+  height: 15px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--warn);
+  font-size: 9px;
+}
+
+.cx-link {
+  color: var(--text-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.cx-onboard {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  padding: 2px 0;
+}
+.cx-onboard-title {
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 600;
+}

@@ -1,0 +1,58 @@
+{
+  "name": "codexcapper",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Codex 额度桌面组件：在任务栏或桌面上显示 Codex 各额度窗口的剩余比例与重置倒计时。",
+  "license": "GPL-3.0-or-later",
+  "author": "JDui",
+  "homepage": "https://github.com/JDui/CodexCapper",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JDui/CodexCapper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JDui/CodexCapper/issues"
+  },
+  "keywords": [
+    "codex",
+    "codex-cli",
+    "usage-monitor",
+    "rate-limit",
+    "quota",
+    "windows",
+    "taskbar-widget",
+    "floating-widget",
+    "desktop-widget",
+    "tauri",
+    "rust"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-opener": "2.5.4",
+    "clsx": "^2.1.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tailwind-merge": "^3.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/node": "^26.3.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.1"
+  }
+}
