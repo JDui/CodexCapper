@@ -1,6 +1,6 @@
 [package]
 name = "codexcapper"
-version = "1.0.0"
+version = "1.1.0"
 description = "Desktop widget for Codex usage windows"
 authors = ["JDui"]
 license = "GPL-3.0-or-later"
@@ -49,6 +49,13 @@ windows = { version = "0.62", features = [
   "Win32_Devices_Display",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Shell",
+  # Where the taskbar's own buttons are is something only the shell knows, and
+  # the way to ask it is UI Automation. VARIANT, which its conditions are built
+  # from, is gated behind Com and Ole as well as Variant.
+  "Win32_UI_Accessibility",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
   "Win32_UI_HiDpi",
   "Win32_System_Power",
   "Win32_System_Threading",

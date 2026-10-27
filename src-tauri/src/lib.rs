@@ -1,6 +1,7 @@
 //! CodexCapper, a Codex usage widget.
 
 pub mod aggregator;
+pub mod appbar;
 pub mod autostart;
 #[cfg(not(windows))]
 pub mod fullscreen_x11;
@@ -10,6 +11,7 @@ pub mod providers;
 pub mod settings;
 pub mod shell;
 pub mod state;
+pub mod taskbar_layout;
 pub mod theme;
 pub mod tray;
 pub mod window;
@@ -269,6 +271,9 @@ pub fn run() {
                 });
             }
 
+            // Started before the reconciler so that the first pinned placement
+            // has something to ask the shell about rather than assuming.
+            taskbar_layout::spawn();
             window::spawn_reconciler(handle.clone());
 
             Ok(())
@@ -277,8 +282,10 @@ pub fn run() {
             tauri::WindowEvent::Moved(_) => window::on_moved(window.app_handle()),
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 // The widget hides instead of closing; the tray is the way back.
+                // Hiding gives the reserved strip back too, so the desktop is
+                // not left with a band kept clear for a window that is gone.
                 api.prevent_close();
-                let _ = window.hide();
+                window::hide_widget(window.app_handle());
             }
             _ => {}
         })
@@ -299,6 +306,12 @@ pub fn run() {
                 let torn_down = session_ending() || window::widget(app).is_none();
                 if !state::is_quitting() && !torn_down {
                     api.prevent_exit();
+                } else {
+                    // The process is ending, so the strip the shell was keeping
+                    // clear for the widget goes back now rather than whenever it
+                    // notices the window is gone. One place for every way out:
+                    // the tray, the watchdog and a sign out all land here.
+                    window::release_dock(app);
                 }
             }
         });

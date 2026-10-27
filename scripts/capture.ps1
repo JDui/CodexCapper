@@ -30,6 +30,7 @@ namespace Cap {
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 
     public static IntPtr BiggestWindow(uint pid) {
       IntPtr best = IntPtr.Zero; long bestArea = 0;
@@ -45,6 +46,7 @@ namespace Cap {
     }
 
     public static string Capture(IntPtr h, string outPath, string mode, int mx, int my, double scale) {
+      if (mode == "region") SetProcessDPIAware(); // otherwise the screen is virtualized and the shot comes out soft
       RECT r; if (!GetWindowRect(h, out r)) return "no rect";
       if (mode == "window") {
         int w = (int)Math.Round((r.Right - r.Left) * scale);

@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize};
 
@@ -68,6 +69,18 @@ static SHOWN_ON_PURPOSE: AtomicBool = AtomicBool::new(false);
 /// hundredths so it fits an integer. Zero means it has not measured itself yet.
 static MEASURED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+/// When the process started, so the first placement can tell a shell that is
+/// about to answer from one that never will.
+static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// How long the widget waits hidden for the first measurement of the strip's
+/// buttons before reserving a strip of its own instead.
+///
+/// The measurement takes about half a second, so this is comfortably long
+/// enough for a normal start and short enough that a shell which cannot answer
+/// is worked around rather than waited for.
+const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Takes the height the interface measured for its own content and resizes the
 /// floating window to match. Taskbar placement ignores it: there the height is
 /// the strip's, not the content's.
@@ -89,6 +102,103 @@ fn floating_height() -> f64 {
         crate::monitor::DEFAULT_LOGICAL_H
     } else {
         stored as f64 / 100.0
+    }
+}
+
+/// What the docked strip should be, in logical pixels.
+///
+/// Pinned placement used to borrow the taskbar's height and let the content
+/// float inside it. A reserved strip cannot afford that: the reservation costs
+/// the whole width of the display, so a row taller than what is drawn in it is
+/// paid for across the entire monitor. The interface measures itself in both
+/// placements now, and this is what it reports.
+fn pinned_height() -> f64 {
+    let stored = MEASURED_HEIGHT.load(Ordering::SeqCst);
+    if stored == 0 {
+        crate::monitor::DEFAULT_PINNED_LOGICAL_H
+    } else {
+        stored as f64 / 100.0
+    }
+}
+
+/// Claims a strip beside the taskbar from the shell and reports what came back.
+///
+/// Only worth asking for while the widget is meant to be on screen: a
+/// reservation held for a hidden widget keeps a band of the desktop clear for
+/// something nobody can see.
+#[cfg(windows)]
+fn reserve_strip(
+    win: &tauri::WebviewWindow,
+    mon: &crate::monitor::MonitorInfo,
+    bar: &crate::monitor::TaskbarInfo,
+    s: &crate::settings::Settings,
+    shown: bool,
+) -> Option<crate::monitor::Rect> {
+    if !shown {
+        release_strip(win);
+        return None;
+    }
+    let hwnd = crate::monitor::hwnd_of(win)?;
+    let plan = crate::monitor::appbar_plan(
+        mon,
+        bar,
+        s.widget.tray_gap,
+        s.providers.enabled_count(),
+        s.widget.compact_mode,
+        s.widget.dock_left(),
+        pinned_height(),
+    )?;
+    crate::appbar::dock(hwnd.0 as isize, &plan, &bar.rect, &mon.bounds)
+}
+
+#[cfg(not(windows))]
+fn reserve_strip(
+    _win: &tauri::WebviewWindow,
+    _mon: &crate::monitor::MonitorInfo,
+    _bar: &crate::monitor::TaskbarInfo,
+    _s: &crate::settings::Settings,
+    _shown: bool,
+) -> Option<crate::monitor::Rect> {
+    None
+}
+
+/// Gives any held strip back to the shell.
+///
+/// Only pinned placement ever takes one, so this is the whole of what floating
+/// placement has to do with the shell: a single load that says there is nothing
+/// to give back, with no window handle resolved and no call into Explorer.
+fn release_strip(win: &tauri::WebviewWindow) {
+    if !crate::appbar::holding() {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(hwnd) = crate::monitor::hwnd_of(win) {
+        crate::appbar::undock(hwnd.0 as isize);
+    }
+    #[cfg(not(windows))]
+    let _ = win;
+}
+
+/// Takes the widget off screen, and with it the claim on the desktop.
+pub fn hide(win: &tauri::WebviewWindow) {
+    release_strip(win);
+    let _ = win.hide();
+}
+
+/// The same, for callers that only hold the application handle.
+pub fn hide_widget(app: &AppHandle) {
+    if let Some(win) = widget(app) {
+        hide(&win);
+    }
+}
+
+/// Gives the shell any strip this process holds, without touching the window.
+/// A deliberate quit wants the work area back at once rather than whenever the
+/// process is reaped, and the shell's own cleanup of a dead window is not
+/// something to rely on for how the desktop looks the moment after quitting.
+pub fn release_dock(app: &AppHandle) {
+    if let Some(win) = widget(app) {
+        release_strip(&win);
     }
 }
 
@@ -155,31 +265,77 @@ pub fn reposition(app: &AppHandle) {
         }
         let pinned = pinned && monitor::supports_panel_docking();
 
+        // Where a pinned widget goes, in the order the desktop allows. Inside
+        // the row is the placement the user asked for and costs nobody any
+        // screen; it is only trustworthy when the buttons were measured, so the
+        // fallback is a strip reserved from the shell — see `crate::appbar` —
+        // and the plain overlay only covers a shell that refuses even that.
+        let mut in_row: Option<monitor::Rect> = None;
+        let mut reserved: Option<monitor::Rect> = None;
+        let mut strip_hwnd: Option<isize> = None;
+        let shown_by_choice = s.widget.visible && !AUTO_HIDDEN.load(Ordering::SeqCst);
+
         let taskbar_target = if pinned {
             match monitor::taskbar_for(&mon) {
                 Some(bar) => {
                     if !bar.on_screen {
-                        let _ = win.hide();
+                        hide(&win);
                         return;
                     }
-                    let columns = s.providers.enabled_count();
-                    let target = monitor::taskbar_position(
+                    strip_hwnd = Some(bar.taskbar_hwnd);
+                    in_row = monitor::inrow_plan(
                         &mon,
                         &bar,
                         s.widget.tray_gap,
-                        columns,
+                        s.providers.enabled_count(),
                         s.widget.compact_mode,
                         s.widget.dock_left(),
+                        pinned_height(),
                     );
-                    if target.is_none() {
-                        // A vertical strip cannot host the layout at all, so
-                        // this one is a real, lasting incompatibility.
-                        tracing::warn!(
-                            "vertical taskbar cannot host the widget, using floating placement"
-                        );
-                        state.settings.update(|s| s.widget.mode = "float".into());
+                    if in_row.is_some() {
+                        // Lying in the row is the whole arrangement: no ground
+                        // is taken from the desktop, so none is held either.
+                        release_strip(&win);
+                        None
+                    } else if crate::taskbar_layout::cluster(bar.taskbar_hwnd).is_none()
+                        && STARTED.get_or_init(Instant::now).elapsed() < GRACE
+                    {
+                        // The buttons have not been measured yet, which is what
+                        // the first second of every run looks like. Reserving a
+                        // strip now would take screen from the desktop for a
+                        // question that is about to be answered — maximized
+                        // windows resize for a reservation and then resize back
+                        // — so the widget stays hidden and waits instead. After
+                        // the grace the reservation is made regardless, because
+                        // a shell that will not answer has to be worked around
+                        // rather than waited for.
+                        tracing::debug!("waiting for the strip to be measured");
+                        hide(&win);
+                        return;
+                    } else {
+                        reserved = reserve_strip(&win, &mon, &bar, &s, shown_by_choice);
+                        if reserved.is_some() {
+                            None
+                        } else {
+                            let target = monitor::taskbar_position(
+                                &mon,
+                                &bar,
+                                s.widget.tray_gap,
+                                s.providers.enabled_count(),
+                                s.widget.compact_mode,
+                                s.widget.dock_left(),
+                            );
+                            if target.is_none() {
+                                // A vertical strip cannot host the layout at all, so
+                                // this one is a real, lasting incompatibility.
+                                tracing::warn!(
+                                    "vertical taskbar cannot host the widget, using floating placement"
+                                );
+                                state.settings.update(|s| s.widget.mode = "float".into());
+                            }
+                            target
+                        }
                     }
-                    target
                 }
                 None => {
                     // The strip is not always reachable, for instance while the
@@ -191,41 +347,45 @@ pub fn reposition(app: &AppHandle) {
                 }
             }
         } else {
+            // Floating placement owns nothing, so a strip held from a pass when
+            // the widget was pinned goes back here rather than staying reserved.
+            release_strip(&win);
             None
         };
 
-        let (x, y, w, h) = match taskbar_target {
-            Some(t) => t,
-            None => {
-                let logical_h = floating_height();
-                let (tx, ty, w, h) = monitor::target_position(
-                    &mon,
-                    s.widget.edge_offset_x,
-                    s.widget.edge_offset_y,
-                    logical_h,
-                );
-                let (x, y, w, h) = monitor::clamp_or_primary(tx, ty, w, h, logical_h);
+        log_placement(pinned, in_row.is_some(), reserved.is_some());
 
-                // If the clamp had to step in, the stored offset is invalid and
-                // would keep producing the same wrong target.
-                if (x, y) != (tx, ty)
-                    && (s.widget.edge_offset_x != 0 || s.widget.edge_offset_y != 0)
-                {
-                    tracing::info!("stored offset pointed off screen, resetting it");
-                    state.settings.update(|s| {
-                        s.widget.edge_offset_x = 0;
-                        s.widget.edge_offset_y = 0;
-                    });
+        let (x, y, w, h) = match in_row.or(reserved) {
+            Some(r) => (r.left, r.top, r.width(), r.height()),
+            None => match taskbar_target {
+                Some(t) => t,
+                None => {
+                    let logical_h = floating_height();
+                    let (tx, ty, w, h) = monitor::target_position(
+                        &mon,
+                        s.widget.edge_offset_x,
+                        s.widget.edge_offset_y,
+                        logical_h,
+                    );
+                    let (x, y, w, h) = monitor::clamp_or_primary(tx, ty, w, h, logical_h);
+
+                    // If the clamp had to step in, the stored offset is invalid and
+                    // would keep producing the same wrong target.
+                    if (x, y) != (tx, ty)
+                        && (s.widget.edge_offset_x != 0 || s.widget.edge_offset_y != 0)
+                    {
+                        tracing::info!("stored offset pointed off screen, resetting it");
+                        state.settings.update(|s| {
+                            s.widget.edge_offset_x = 0;
+                            s.widget.edge_offset_y = 0;
+                        });
+                    }
+                    (x, y, w, h)
                 }
-                (x, y, w, h)
-            }
+            },
         };
 
-        if pinned
-            && s.widget.visible
-            && !AUTO_HIDDEN.load(Ordering::SeqCst)
-            && !win.is_visible().unwrap_or(true)
-        {
+        if pinned && shown_by_choice && !win.is_visible().unwrap_or(true) {
             let _ = win.show();
         }
 
@@ -235,8 +395,19 @@ pub fn reposition(app: &AppHandle) {
         let _ = win.set_position(PhysicalPosition::new(x, y));
         resize(&win, w as u32, h as u32);
         let _ = win.set_position(PhysicalPosition::new(x, y));
-        let _ = win.set_always_on_top(true);
         apply_ex_styles(app);
+        match strip_hwnd {
+            Some(taskbar) => {
+                PINNED_STRIP.store(taskbar, Ordering::SeqCst);
+                stack_above_strip(&win, taskbar);
+            }
+            // Floating placement keeps the toolkit's idea of always on top,
+            // which is the entire point of a floating window.
+            None => {
+                PINNED_STRIP.store(0, Ordering::SeqCst);
+                let _ = win.set_always_on_top(true);
+            }
+        }
 
         // The friendly name is only stored for an explicitly pinned monitor.
         if how == monitor::Resolution::Pinned
@@ -367,7 +538,7 @@ pub fn show(app: &AppHandle) {
 pub fn toggle_visibility(app: &AppHandle) {
     let Some(win) = widget(app) else { return };
     if win.is_visible().unwrap_or(false) {
-        let _ = win.hide();
+        hide(&win);
         app.state::<Arc<AppState>>()
             .settings
             .update(|s| s.widget.visible = false);
@@ -456,7 +627,7 @@ fn apply_fullscreen_hiding(app: &AppHandle, fullscreen: bool, stable_clear: bool
                 fullscreen_window_description(),
                 FULLSCREEN_SOURCE.lock()
             );
-            let _ = win.hide();
+            hide(&win);
             AUTO_HIDDEN.store(true, Ordering::SeqCst);
         }
         HideAction::Restore => {
@@ -608,13 +779,153 @@ fn fullscreen_window_description() -> String {
 
 /// Reclaims the top of the topmost band when something has covered the widget.
 ///
+/// Which of the pinned placements is live, logged whenever it changes.
+///
+/// The three look alike on screen — a widget in the row, a widget in a strip
+/// beside it and a widget hovering over it all read as "the thing on the
+/// taskbar" — so working out what a complaint is about starts here.
+static PLACEMENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn log_placement(pinned: bool, in_row: bool, reserved: bool) {
+    let (mode, words) = match (pinned, in_row, reserved) {
+        (false, _, _) => (1, "floating window"),
+        (true, true, _) => (2, "inside the taskbar row"),
+        (true, false, true) => (3, "in a strip reserved beside the taskbar"),
+        (true, false, false) => (4, "over the taskbar, dodging its buttons"),
+    };
+    if PLACEMENT.swap(mode, Ordering::SeqCst) != mode {
+        tracing::info!("placement: {words}");
+    }
+}
+
+/// The strip the widget is laid on, or 0 while it floats.
+///
+/// Keeping the widget above the shell needs to know which window is the shell,
+/// and a pinned widget already learned that the last time it was placed. The
+/// reconciler runs several times a second and should not go looking for it.
+static PINNED_STRIP: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// The window to name so that we end up immediately above the strip.
+///
+/// Insertion means "immediately *below* the window you name", other process or
+/// not, so naming the strip itself buries the widget underneath it — measured,
+/// not guessed: naming `Shell_TrayWnd` left the widget in the strip's own
+/// rectangle with the strip on top of it and nothing visible. The neighbour
+/// above the strip is the window that puts us where we want to be. Ourselves,
+/// which is normally what is there once this has run once, is skipped.
+#[cfg(windows)]
+fn anchor_above_strip(
+    taskbar: windows::Win32::Foundation::HWND,
+    ours: windows::Win32::Foundation::HWND,
+) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindow, GW_HWNDPREV};
+
+    unsafe {
+        let mut above = GetWindow(taskbar, GW_HWNDPREV).ok()?;
+        for _ in 0..64 {
+            if above.0.is_null() {
+                return None;
+            }
+            if above != ours {
+                return Some(above);
+            }
+            above = GetWindow(above, GW_HWNDPREV).ok()?;
+        }
+        None
+    }
+}
+
+/// Keeps the widget above the strip it lies on, and no higher than that.
+///
+/// Being in the topmost band is what makes the widget visible over the taskbar
+/// at all. Being at the *top* of that band is what made it float over the
+/// screenshot the user had just taken: raising the window above whatever
+/// happened to be covering it also raises it above an open menu, a tooltip and
+/// a snipping tool's frozen capture, all of which are meant to be above
+/// everything. Inserting immediately above the taskbar puts the widget one step
+/// up from the shell and below every window that genuinely asked to be on top,
+/// which is the right demeanour for a taskbar resident.
+#[cfg(windows)]
+fn stack_above_strip(win: &tauri::WebviewWindow, taskbar_hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, WS_EX_TOPMOST,
+    };
+
+    let Some(hwnd) = crate::monitor::hwnd_of(win) else {
+        return;
+    };
+    let taskbar = HWND(taskbar_hwnd as *mut core::ffi::c_void);
+    unsafe {
+        // Inserting relative to a window only places us beside it, it does not
+        // lift us into the topmost band, so the flag goes back first whenever
+        // something has taken it away.
+        if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 == 0 {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+
+        // With the strip itself on top of the world there is no neighbour to
+        // tuck under, and the top of the band is where the widget belongs
+        // anyway; otherwise the neighbour above the strip is the anchor.
+        let below = anchor_above_strip(taskbar, hwnd);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(below.unwrap_or(HWND_TOPMOST)),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Whether it is the shell's own strip that has come to lie on top of us.
+#[cfg(windows)]
+fn covered_by_strip(hwnd: windows::Win32::Foundation::HWND, taskbar_hwnd: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindow, GW_HWNDPREV};
+
+    unsafe {
+        let mut above = GetWindow(hwnd, GW_HWNDPREV).ok();
+        // The walk stays inside the topmost band, which is a handful of
+        // windows. The bound is only here so a surprising answer cannot spin.
+        for _ in 0..64 {
+            let Some(window) = above else {
+                return false;
+            };
+            if window.0 as isize == taskbar_hwnd {
+                return true;
+            }
+            if window.0.is_null() {
+                return false;
+            }
+            above = GetWindow(window, GW_HWNDPREV).ok();
+        }
+        false
+    }
+}
+
+/// Recovers the widget's stacking position when the shell takes it away.
+///
 /// The toolkit's always-on-top setter is a no-op here: the flag is set when the
 /// window is created, so the call returns before it reaches the platform. That
-/// left the widget with no way to recover its stacking position. The shell
-/// raises its own window whenever the taskbar, Start menu or notification area
-/// is touched, and in taskbar placement that leaves the widget behind an opaque
-/// strip. Checking first means the window is only restacked when it is really
-/// obscured, so other topmost windows are not fought for no reason.
+/// left the widget with no way to recover its position, and the shell raises its
+/// own window whenever the taskbar, Start menu or notification area is touched —
+/// which, with the widget lying in the strip, leaves it behind an opaque bar.
+///
+/// Pinned, the strip is the only window worth restacking for, and recovering
+/// means an insertion directly above it rather than a jump to the top of the
+/// desktop. Floating, the widget is meant to sit above the ordinary windows of
+/// the session, so anything covering it at all is a reason to come back up.
 #[cfg(windows)]
 fn ensure_on_top(app: &AppHandle) {
     use windows::Win32::Foundation::{POINT, RECT};
@@ -630,6 +941,17 @@ fn ensure_on_top(app: &AppHandle) {
     let Some(hwnd) = crate::monitor::hwnd_of(&win) else {
         return;
     };
+
+    // Pinned, the strip is the only window worth restacking for. Anything else
+    // that has come to lie over the widget is a menu, a tooltip or somebody's
+    // screenshot, and belongs there.
+    let taskbar = PINNED_STRIP.load(Ordering::SeqCst);
+    if taskbar != 0 {
+        if covered_by_strip(hwnd, taskbar) {
+            stack_above_strip(&win, taskbar);
+        }
+        return;
+    }
 
     unsafe {
         let mut rect = RECT::default();
@@ -659,6 +981,9 @@ fn ensure_on_top(app: &AppHandle) {
         );
     }
 }
+
+#[cfg(not(windows))]
+fn stack_above_strip(_win: &tauri::WebviewWindow, _taskbar_hwnd: isize) {}
 
 #[cfg(not(windows))]
 fn ensure_on_top(_app: &AppHandle) {}
@@ -783,6 +1108,15 @@ pub fn spawn_reconciler(app: AppHandle) {
             if !fullscreen {
                 ensure_on_top(&app);
             }
+
+            // The toolkit recomputes its own idea of the extended styles
+            // whenever it resizes or shows the window, which quietly drops the
+            // two we care about — and a widget that has lost NOACTIVATE starts
+            // stealing focus from whatever the user was typing into. Placement
+            // passes are event driven and do not run on most ticks, and they do
+            // not run at all while a fullscreen window is up with the widget
+            // allowed to stay visible, so the flags are asserted here too.
+            apply_ex_styles(&app);
         }
     });
 }
@@ -805,8 +1139,12 @@ fn topology_signature(app: &AppHandle) -> String {
     if s.widget.taskbar_mode() {
         if let Some((mon, _)) = crate::monitor::resolve(s.widget.monitor_stable_id.as_deref()) {
             match crate::monitor::taskbar_for(&mon) {
+                // The buttons belong in the signature too: the widget now lies
+                // among them, so the moment they reach into its ground is the
+                // moment it has to move. Nothing else announces that — the work
+                // area and the strip itself stay exactly as they were.
                 Some(bar) => signature.push_str(&format!(
-                    "|tb:{},{},{},{}:{}:{}:sr{}:{}",
+                    "|tb:{},{},{},{}:{}:{}:sr{}:{}:ti{:?},{}",
                     bar.rect.left,
                     bar.rect.top,
                     bar.rect.right,
@@ -814,7 +1152,9 @@ fn topology_signature(app: &AppHandle) -> String {
                     bar.tray_left,
                     bar.on_screen,
                     bar.start_right,
-                    s.widget.dock_side
+                    s.widget.dock_side,
+                    bar.task_items_left,
+                    bar.task_items_right
                 )),
                 None => signature.push_str("|tb:none"),
             }

@@ -151,15 +151,26 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* Taskbar placement. The strip is around 48px tall, so each provider becomes a
-   narrow column with both windows stacked and the columns sit side by side. */
+/* Taskbar placement. The widget embeds seamlessly into the taskbar row:
+   transparent background, no borders or drop-shadows, matching the native
+   system tray elements. */
 
 .cx-shell[data-placement="taskbar"] {
-  border-radius: 6px;
+  border-radius: 4px;
+  background: transparent;
+  border: 1px solid transparent;
+  backdrop-filter: none;
+  box-shadow: none;
+  transition: background 150ms ease;
+}
+
+.cx-shell[data-placement="taskbar"]:hover {
+  background: var(--track);
 }
 
 .cx-shell[data-placement="taskbar"] .cx-bars {
-  padding: 3px 6px;
+  background: transparent;
+  padding: 2px 4px;
 }
 
 .cx-columns {

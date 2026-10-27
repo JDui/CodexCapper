@@ -135,10 +135,12 @@ export default function App() {
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const contentRef = React.useRef<HTMLDivElement | null>(null);
 
-  // The floating window is sized to what is actually on screen, so an empty
-  // status line does not sit in a window built for two bars.
+  // The window is sized to what is actually on screen, so an empty status line
+  // does not sit in a window built for two bars. Pinned placement needs the
+  // number even more than floating does: the strip it reserves beside the
+  // taskbar is charged against the whole width of the display, so a row taller
+  // than what is drawn inside it is paid for twice.
   React.useEffect(() => {
-    if (pinned) return;
     const content = contentRef.current;
     const shell = shellRef.current;
     const bars = content?.parentElement;
