@@ -64,10 +64,13 @@ export interface UsagePayload {
 
 export interface AppearanceConfig {
   theme: "system" | "dark" | "light";
+  /** User-selected family; the native taskbar and WebView share this setting. */
+  font_family: "system" | "serif" | "mono";
   compact_mode: boolean;
   show_model_weekly: boolean;
   placement: "float" | "taskbar";
-  /** "absolute" (19:42) or "countdown" (2小时0分) for the reset time. */
+  /** "auto" switches near reset; "absolute" prints HH:mm or MM/dd HH:mm;
+   * "countdown" prints time remaining, e.g. 2h 5m. */
   reset_time_style: string;
   resolved_theme: "dark" | "light";
 }

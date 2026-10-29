@@ -1,6 +1,6 @@
 [package]
 name = "codexcapper"
-version = "2.0.0"
+version = "2.1.0"
 description = "Desktop widget for Codex usage windows"
 authors = ["JDui"]
 license = "GPL-3.0-or-later"
@@ -46,6 +46,11 @@ x11rb = "0.13"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Imaging",
   "Win32_Devices_Display",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Shell",

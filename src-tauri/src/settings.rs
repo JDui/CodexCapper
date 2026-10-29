@@ -21,6 +21,7 @@ pub struct WidgetSettings {
     pub corner: String,
     pub edge_offset_x: i32,
     pub edge_offset_y: i32,
+    #[serde(default = "yes")]
     pub compact_mode: bool,
     pub click_through: bool,
     /// "float" for a free floating window, "taskbar" to pin into the strip.
@@ -35,7 +36,8 @@ pub struct WidgetSettings {
     #[serde(default = "default_dock_side")]
     pub dock_side: String,
     /// How the widget prints a window's reset time after the percentage:
-    /// "absolute" for a clock time, "countdown" for time remaining.
+    /// "auto" switches near reset, "absolute" prints a clock time, and
+    /// "countdown" always prints time remaining.
     #[serde(default = "default_reset_time_style")]
     pub reset_time_style: String,
     #[serde(default = "yes")]
@@ -57,9 +59,7 @@ fn default_dock_side() -> String {
 }
 
 fn default_reset_time_style() -> String {
-    // How far off the reset is reads better as a countdown; the exact clock
-    // time stays one click away in the tray.
-    "countdown".into()
+    "auto".into()
 }
 
 impl Default for WidgetSettings {
@@ -71,7 +71,7 @@ impl Default for WidgetSettings {
             corner: "bottom-right".into(),
             edge_offset_x: 0,
             edge_offset_y: 0,
-            compact_mode: false,
+            compact_mode: true,
             click_through: false,
             mode: default_mode(),
             tray_gap: default_tray_gap(),
@@ -96,12 +96,20 @@ impl WidgetSettings {
 pub struct AppearanceSettings {
     /// "system", "dark" or "light".
     pub theme: String,
+    /// "system", "serif" or "mono".
+    #[serde(default = "default_font_family")]
+    pub font_family: String,
+}
+
+fn default_font_family() -> String {
+    "system".into()
 }
 
 impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
             theme: "system".into(),
+            font_family: default_font_family(),
         }
     }
 }
@@ -341,5 +349,44 @@ mod tests {
         assert_eq!(parsed.polling.http_interval_secs, 180);
         assert!(parsed.providers.codex.enabled);
         assert!(parsed.widget.taskbar_mode());
+        assert!(parsed.widget.compact_mode);
+        assert_eq!(parsed.widget.reset_time_style, "auto");
+        assert_eq!(parsed.appearance.font_family, "system");
+    }
+
+    #[test]
+    fn older_appearance_settings_gain_a_font_without_losing_the_theme() {
+        let old: AppearanceSettings = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
+        assert_eq!(old.theme, "light");
+        assert_eq!(old.font_family, "system");
+        for family in ["system", "serif", "mono"] {
+            let saved = AppearanceSettings {
+                theme: "dark".into(),
+                font_family: family.into(),
+            };
+            let restored: AppearanceSettings =
+                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            assert_eq!(restored.font_family, family);
+            assert_eq!(restored.theme, "dark");
+        }
+    }
+
+    #[test]
+    fn missing_new_options_use_compact_auto_without_replacing_saved_choices() {
+        let mut json = serde_json::to_value(WidgetSettings::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("compact_mode");
+        object.remove("reset_time_style");
+        let parsed: WidgetSettings = serde_json::from_value(json).unwrap();
+        assert!(parsed.compact_mode);
+        assert_eq!(parsed.reset_time_style, "auto");
+
+        let mut saved = WidgetSettings::default();
+        saved.compact_mode = false;
+        saved.reset_time_style = "countdown".into();
+        let parsed: WidgetSettings =
+            serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
+        assert!(!parsed.compact_mode);
+        assert_eq!(parsed.reset_time_style, "countdown");
     }
 }

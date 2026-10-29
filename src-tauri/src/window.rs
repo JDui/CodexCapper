@@ -354,7 +354,9 @@ pub fn reposition(app: &AppHandle) {
                     if let Some(mut rect) = in_row {
                         // Native rendering has its own title and rows. A hidden
                         // WebView's measured height does not describe them.
-                        let height = (if s.widget.compact_mode { 20.0 } else { 44.0 } * mon.scale())
+                        let height =
+                            (crate::taskbar_embed::content_height(app, s.widget.compact_mode)
+                                * mon.scale())
                             .round() as i32;
                         let height = height.min(bar.rect.height()).max(1);
                         rect.top = bar.rect.top + (bar.rect.height() - height) / 2;

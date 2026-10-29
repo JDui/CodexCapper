@@ -1,7 +1,17 @@
 @import "tailwindcss";
 
+:root {
+  --ui-font: "Segoe UI", "Microsoft YaHei UI", ui-sans-serif, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+html[data-font-family="serif"] {
+  --ui-font: Georgia, Cambria, "Times New Roman", SimSun, ui-serif, serif;
+}
+html[data-font-family="mono"] {
+  --ui-font: Consolas, "Microsoft YaHei UI", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 /* The floating card follows chatgpt-model-meter's palette and row geometry.
-   Native taskbar painting uses the same palette in taskbar_embed.rs. */
+   Native taskbar painting uses the same palette in taskbar_render.rs. */
 :root,
 html[data-theme="dark"] {
   --five-hour-fill: linear-gradient(90deg, #6da5af, #a6c9bd);
@@ -14,6 +24,10 @@ html[data-theme="dark"] {
   --warn: #f5b84e;
   --danger: #ef7373;
   --shadow: 0 2px 10px rgba(0, 0, 0, .32);
+  --capsule-five-fill: linear-gradient(90deg, #7caeb4, #a5cbc0);
+  --capsule-weekly-fill: linear-gradient(90deg, #aaa4cc, #cec1e0);
+  --capsule-track: #c7cbd4;
+  --capsule-outline: #68778d;
 }
 
 html[data-theme="light"] {
@@ -27,6 +41,10 @@ html[data-theme="light"] {
   --warn: #a17020;
   --danger: #c62828;
   --shadow: 0 2px 8px rgba(0, 0, 0, .08);
+  --capsule-five-fill: linear-gradient(90deg, #83aeb2, #abd0c4);
+  --capsule-weekly-fill: linear-gradient(90deg, #ada6cd, #d2c6e6);
+  --capsule-track: #eceef2;
+  --capsule-outline: #8791a2;
 }
 
 html, body, #root {
@@ -38,11 +56,12 @@ html, body, #root {
 }
 
 body {
-  font-family: "Segoe UI", "Microsoft YaHei UI", ui-sans-serif, system-ui, sans-serif;
+  font-family: var(--ui-font);
   font-size: 13px;
   line-height: 1.15;
   color: var(--text-primary);
-  -webkit-font-smoothing: antialiased;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
   user-select: none;
   cursor: default;
 }
@@ -183,19 +202,6 @@ body {
 .cx-onboard { display: flex; flex-direction: column; gap: 5px; padding: 2px 0; font-size: 11px; line-height: 1.5; color: var(--text-secondary); }
 .cx-onboard-title { color: var(--text-primary); font-weight: 700; }
 
-/* The miniature floating window is a single 154x24px quota row. Subscription
-   details live in the row tooltip and settings remain on the context menu. */
-.cx-shell[data-placement="float"][data-compact="true"] { font-size: 11px; border-radius: 6px; cursor: grab; }
-.cx-shell[data-placement="float"][data-compact="true"]:active { cursor: grabbing; }
-.cx-shell[data-placement="float"][data-compact="true"] .cx-bars { padding: 3px 4px; }
-.cx-shell[data-placement="float"][data-compact="true"] .cx-row {
-  grid-template-columns: 16px minmax(0, 1fr) 28px 42px;
-  gap: 3px;
-  height: 16px;
-}
-.cx-shell[data-placement="float"][data-compact="true"] .cx-track { height: 5px; }
-.cx-shell[data-placement="float"][data-compact="true"] .cx-countdown { font-size: 10px; }
-
 /* The WebView is used only as a fallback when native embedding has no slot.
    Keep its rows short enough to fit the measured taskbar strip. */
 .cx-shell[data-placement="taskbar"] {
@@ -214,6 +220,79 @@ body {
 .cx-column-empty { align-items: center; font-size: 10px; color: var(--text-secondary); min-height: 20px; }
 .cx-column-empty-text { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+/* Compact mode is the quota bar itself, with no surrounding card. A second
+   actual window adds a second capsule; a weekly-only plan stays one capsule. */
+.cx-shell[data-compact="true"] {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  backdrop-filter: none;
+  box-shadow: none;
+  font-size: 11px;
+}
+.cx-shell[data-placement="float"][data-compact="true"] { cursor: grab; }
+.cx-shell[data-placement="float"][data-compact="true"]:active { cursor: grabbing; }
+.cx-shell[data-compact="true"] .cx-bars { padding: 0; }
+.cx-shell[data-compact="true"] .cx-group,
+.cx-shell[data-compact="true"] .cx-column { display: flex; flex-direction: column; gap: 2px; }
+.cx-shell[data-compact="true"] .cx-status span { overflow-wrap: anywhere; }
+.cx-capsule {
+  --capsule-height: 18px;
+  --capsule-target-size: 11px;
+  position: relative;
+  flex: 0 0 var(--capsule-height);
+  height: var(--capsule-height);
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: 999px;
+  box-sizing: border-box;
+  border: 1px solid var(--capsule-outline);
+  background: var(--capsule-track);
+}
+.cx-capsule[data-single="true"] { --capsule-height: 22px; --capsule-target-size: 12px; }
+.cx-capsule-track {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  background: var(--capsule-track);
+}
+.cx-capsule-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--capsule-five-fill);
+  transition: width 220ms ease;
+}
+.cx-capsule[data-window="7d"] .cx-capsule-fill { background: var(--capsule-weekly-fill); }
+.cx-capsule[data-stale="true"] .cx-capsule-fill { background: #b5bac5; }
+.cx-capsule-text {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: var(--capsule-gap, 2px);
+  box-sizing: border-box;
+  padding: 0 6px;
+  color: #111827;
+  font-size: var(--capsule-font-size, var(--capsule-target-size));
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.cx-capsule[data-labeled="true"] .cx-capsule-text { grid-template-columns: max-content minmax(0, 1fr) auto; }
+.cx-capsule-label, .cx-capsule-percent { font-weight: 500; }
+.cx-capsule-reset { font-size: inherit; font-weight: 500; text-align: right; }
+html[data-font-family="serif"] .cx-capsule-label,
+html[data-font-family="serif"] .cx-capsule-percent,
+html[data-font-family="serif"] .cx-capsule-reset { font-weight: 400; }
+/* Fill is clipped by the inner track, so it cannot cover or reshape the border.
+   New fill/track endpoints have at least 7.24:1 contrast with #111827 ink;
+   the single text layer never splits a glyph at the progress boundary. */
+
 @keyframes cx-rainbow {
   from { background-position: 0% 50%; }
   to { background-position: 400% 50%; }
@@ -224,6 +303,6 @@ body {
   animation: cx-rainbow 1.6s linear infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .cx-fill { transition: none; }
+  .cx-fill, .cx-capsule-fill { transition: none; }
   .cx-celebrate .cx-fill { animation: none; }
 }

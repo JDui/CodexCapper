@@ -1,7 +1,7 @@
 {
   "name": "codexcapper",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Codex 额度桌面组件：在任务栏或桌面上显示 Codex 各额度窗口的剩余比例与重置倒计时。",
   "license": "GPL-3.0-or-later",
   "author": "JDui",

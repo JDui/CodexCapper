@@ -5,20 +5,18 @@
 //! message-only window outlives the taskbar child, so Explorer replacing its
 //! window cannot take the recovery timer with it.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tauri::{AppHandle, Manager};
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, GetWindowDpiAwarenessContext, SetThreadDpiAwarenessContext,
-};
+use windows::Win32::UI::HiDpi::{GetWindowDpiAwarenessContext, SetThreadDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::model::{Source, WindowSnapshot};
+use crate::model::WindowSnapshot;
 use crate::monitor::Rect;
 use crate::state::{AppState, Refresh};
 
@@ -28,6 +26,7 @@ static MANAGER: AtomicIsize = AtomicIsize::new(0);
 static CHILD: AtomicIsize = AtomicIsize::new(0);
 static FAILED_PARENT: AtomicIsize = AtomicIsize::new(0);
 static ENGAGED: AtomicBool = AtomicBool::new(false);
+static ROW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static REQUEST: parking_lot::Mutex<Option<Placement>> = parking_lot::Mutex::new(None);
 
 #[derive(Clone, Copy)]
@@ -197,10 +196,6 @@ unsafe fn apply() -> windows::core::Result<()> {
                 Some(HINSTANCE(GetModuleHandleW(None)?.0)),
                 None,
             )?;
-            if let Err(error) = SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA) {
-                let _ = DestroyWindow(child);
-                return Err(error);
-            }
             CHILD.store(child.0 as isize, Ordering::SeqCst);
             tracing::info!(
                 "native taskbar child created: child={:#x}, parent={:#x}, WS_CHILD",
@@ -215,6 +210,9 @@ unsafe fn apply() -> windows::core::Result<()> {
         if !ScreenToClient(parent, &mut origin).as_bool() {
             return Err(windows::core::Error::from_thread());
         }
+        let settings = APP
+            .get()
+            .map(|app| app.state::<Arc<AppState>>().settings.get());
         SetWindowPos(
             child,
             Some(HWND_TOP),
@@ -224,16 +222,7 @@ unsafe fn apply() -> windows::core::Result<()> {
             request.rect.height(),
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )?;
-        let click_through = APP
-            .get()
-            .map(|app| {
-                app.state::<Arc<AppState>>()
-                    .settings
-                    .get()
-                    .widget
-                    .click_through
-            })
-            .unwrap_or(false);
+        let click_through = settings.is_some_and(|s| s.widget.click_through);
         let old_style = GetWindowLongPtrW(child, GWL_EXSTYLE);
         let mask = WS_EX_TRANSPARENT.0 as isize;
         let style = if click_through {
@@ -244,7 +233,9 @@ unsafe fn apply() -> windows::core::Result<()> {
         if style != old_style {
             SetWindowLongPtrW(child, GWL_EXSTYLE, style);
         }
-        let _ = InvalidateRect(Some(child), None, false);
+        if let Some(app) = APP.get() {
+            crate::taskbar_render::render(child, app)?;
+        }
         Ok(())
     })();
     if !previous.0.is_null() {
@@ -285,6 +276,10 @@ unsafe extern "system" fn manager_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     crate::window::reposition(app);
                 }
                 if engaged() {
+                    let count = rows(app.state::<Arc<AppState>>().payload.read().as_ref()).len();
+                    if ROW_COUNT.swap(count, Ordering::SeqCst) != count {
+                        crate::window::reposition(app);
+                    }
                     let child = handle(CHILD.load(Ordering::SeqCst));
                     // The manager survives destruction of the Explorer child.
                     // Re-resolve the taskbar instead of trusting its old HWND.
@@ -369,86 +364,34 @@ unsafe extern "system" fn child_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
     }
 }
 
-/// One or two actual windows, including weekly-only accounts. Compact mode
-/// selects the most consumed window without assuming either slot is present.
-fn rows(
-    payload: Option<&crate::model::UsagePayload>,
-    compact: bool,
-) -> Vec<(&str, &WindowSnapshot)> {
-    let mut rows: Vec<_> = payload
+/// Keep every actual window, including weekly-only accounts, in slot order.
+pub(crate) fn rows(payload: Option<&crate::model::UsagePayload>) -> Vec<(&str, &WindowSnapshot)> {
+    payload
         .into_iter()
         .flat_map(|p| &p.providers)
         .filter(|p| p.enabled)
         .flat_map(|p| [("5h", p.five_hour.as_ref()), ("7d", p.weekly.as_ref())])
         .filter_map(|(label, window)| window.map(|w| (w.label.as_deref().unwrap_or(label), w)))
-        .collect();
-    if compact && rows.len() > 1 {
-        rows.sort_by(|a, b| b.1.utilization.total_cmp(&a.1.utilization));
-        rows.truncate(1);
-    }
-    rows
+        .collect()
 }
 
-fn reset_text(
-    window: &WindowSnapshot,
-    style: &str,
-    now: chrono::DateTime<chrono::Utc>,
-    compact: bool,
-) -> String {
-    let Some(reset) = window.resets_at else {
-        return String::new();
-    };
-    let seconds = (reset - now).num_seconds();
-    if seconds <= 0 {
-        return "即将重置".into();
-    }
-    if style != "countdown" {
-        return reset
-            .with_timezone(&chrono::Local)
-            .format(if compact { "%H:%M" } else { "%m/%d %H:%M" })
-            .to_string();
-    }
-    let seconds = ((seconds + 59) / 60) * 60;
-    if compact && seconds >= 86400 {
-        format!("{}d {}h", seconds / 86400, seconds % 86400 / 3600)
-    } else if seconds >= 86400 {
-        format!(
-            "{}d {}h {}m",
-            seconds / 86400,
-            seconds % 86400 / 3600,
-            seconds % 3600 / 60
-        )
-    } else if seconds >= 3600 {
-        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
+pub(crate) fn compact_height(count: usize) -> f64 {
+    if count <= 1 {
+        crate::monitor::COMPACT_SINGLE_LOGICAL_H
     } else {
-        format!("{}m", (seconds + 59) / 60)
+        18.0 * count as f64 + 2.0 * (count - 1) as f64
     }
 }
 
-unsafe fn fill(dc: HDC, rect: RECT, color: COLORREF) {
-    let brush = CreateSolidBrush(color);
-    if !brush.0.is_null() {
-        FillRect(dc, &rect, brush);
-        let _ = DeleteObject(brush.into());
+pub fn content_height(app: &AppHandle, compact: bool) -> f64 {
+    if compact {
+        compact_height(rows(app.state::<Arc<AppState>>().payload.read().as_ref()).len())
+    } else {
+        44.0
     }
 }
 
-unsafe fn text(dc: HDC, value: &str, mut rect: RECT, color: COLORREF) {
-    let mut wide: Vec<u16> = value.encode_utf16().collect();
-    SetTextColor(dc, color);
-    DrawTextW(
-        dc,
-        &mut wide,
-        &mut rect,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-    );
-}
-
-fn rgb(value: u32) -> COLORREF {
-    COLORREF((value & 0xff) << 16 | (value & 0xff00) | (value >> 16 & 0xff))
-}
-
-fn plan_name(plan: Option<&str>) -> String {
+pub(crate) fn plan_name(plan: Option<&str>) -> String {
     match plan.unwrap_or("").to_ascii_lowercase().as_str() {
         "prolite" | "pro_lite" | "pro-lite" => "Pro Lite".into(),
         "pro" => "Pro".into(),
@@ -463,283 +406,22 @@ fn plan_name(plan: Option<&str>) -> String {
     }
 }
 
-unsafe fn rounded(dc: HDC, rect: RECT, radius: i32, color: COLORREF) {
-    let region = CreateRoundRectRgn(
-        rect.left,
-        rect.top,
-        rect.right + 1,
-        rect.bottom + 1,
-        radius * 2,
-        radius * 2,
-    );
-    let brush = CreateSolidBrush(color);
-    let _ = FillRgn(dc, region, brush);
-    let _ = DeleteObject(brush.into());
-    let _ = DeleteObject(region.into());
-}
-
-unsafe fn gradient(dc: HDC, rect: RECT, radius: i32, start: u32, end: u32) {
-    let width = rect.right - rect.left;
-    if width <= 0 {
-        return;
-    }
-    let saved = SaveDC(dc);
-    let region = CreateRoundRectRgn(
-        rect.left,
-        rect.top,
-        rect.right + 1,
-        rect.bottom + 1,
-        radius * 2,
-        radius * 2,
-    );
-    SelectClipRgn(dc, Some(region));
-    for x in 0..width {
-        let mut color = 0;
-        for shift in [0, 8, 16] {
-            let a = (start >> shift & 255) as f64;
-            let b = (end >> shift & 255) as f64;
-            color |= ((a + (b - a) * x as f64 / (width - 1).max(1) as f64).round() as u32) << shift;
-        }
-        fill(
-            dc,
-            RECT {
-                left: rect.left + x,
-                right: rect.left + x + 1,
-                ..rect
-            },
-            rgb(color),
-        );
-    }
-    let _ = RestoreDC(dc, saved);
-    let _ = DeleteObject(region.into());
-}
-
 unsafe fn paint(hwnd: HWND) {
+    // Per-pixel alpha is submitted by UpdateLayeredWindow. Validate WM_PAINT's
+    // update region without mixing GDI text or color-key transparency into it.
     let mut ps = PAINTSTRUCT::default();
-    let target = BeginPaint(hwnd, &mut ps);
-    if target.0.is_null() {
-        return;
-    }
-    let mut rect = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rect);
-    let dc = CreateCompatibleDC(Some(target));
-    let bitmap = CreateCompatibleBitmap(target, rect.right.max(1), rect.bottom.max(1));
-    if dc.0.is_null() || bitmap.0.is_null() {
-        if !bitmap.0.is_null() {
-            let _ = DeleteObject(bitmap.into());
-        }
-        if !dc.0.is_null() {
-            let _ = DeleteDC(dc);
-        }
-        let _ = EndPaint(hwnd, &ps);
-        return;
-    }
-    let previous_bitmap = SelectObject(dc, bitmap.into());
-    if let Some(app) = APP.get() {
-        let state = app.state::<Arc<AppState>>();
-        let settings = state.settings.get();
-        let dark = crate::theme::resolve(&settings.appearance.theme) == "dark";
-        let background = rgb(if dark { 0x202020 } else { 0xf3f3f3 });
-        let foreground = COLORREF(if dark { 0xf5f5f5 } else { 0x202020 });
-        let muted = COLORREF(if dark { 0xaaaaaa } else { 0x666666 });
-        fill(dc, rect, background);
-        SetBkMode(dc, TRANSPARENT);
-        let scale = GetDpiForWindow(hwnd).max(96) as f64 / 96.0;
-        let px = |v: f64| (v * scale).round() as i32;
-        rounded(
-            dc,
-            RECT {
-                left: 1,
-                top: 1,
-                right: rect.right - 1,
-                bottom: rect.bottom - 1,
-            },
-            px(8.0),
-            rgb(if dark { 0x232323 } else { 0xfafafa }),
-        );
-        let font = CreateFontW(
-            -px(10.0),
-            0,
-            0,
-            0,
-            500,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            0,
-            w!("Microsoft YaHei UI"),
-        );
-        let old_font = SelectObject(dc, font.into());
-        let payload = state.payload.read().clone();
-        let rows = rows(payload.as_ref(), settings.widget.compact_mode);
-        let now = chrono::Utc::now();
-        if rows.is_empty() {
-            let status = payload
-                .as_ref()
-                .and_then(|p| p.providers.iter().find(|p| p.enabled))
-                .and_then(|p| p.detail.as_deref())
-                .unwrap_or(if payload.is_none() {
-                    "加载额度…"
-                } else {
-                    "暂无额度数据"
-                });
-            text(
-                dc,
-                status,
-                RECT {
-                    left: px(5.0),
-                    ..rect
-                },
-                foreground,
-            );
-        } else {
-            let header_height = if settings.widget.compact_mode {
-                0
-            } else {
-                px(13.0)
-            };
-            let row_height =
-                px(16.0).min((rect.bottom - header_height - px(2.0)).max(1) / rows.len() as i32);
-            let top = (rect.bottom - header_height - row_height * rows.len() as i32) / 2;
-            let provider = payload
-                .as_ref()
-                .and_then(|p| p.providers.iter().find(|p| p.enabled));
-            if !settings.widget.compact_mode {
-                text(
-                    dc,
-                    &plan_name(provider.and_then(|p| p.plan_type.as_deref())),
-                    RECT {
-                        left: px(10.0),
-                        top,
-                        right: px(130.0),
-                        bottom: top + header_height,
-                    },
-                    foreground,
-                );
-            }
-            if !settings.widget.compact_mode {
-                text(
-                    dc,
-                    "剩余额度",
-                    RECT {
-                        left: rect.right - px(54.0),
-                        top,
-                        right: rect.right - px(8.0),
-                        bottom: top + header_height,
-                    },
-                    muted,
-                );
-            }
-            for (i, (label, window)) in rows.iter().enumerate() {
-                let y = top + header_height + i as i32 * row_height;
-                let line = |left: f64, right: i32| RECT {
-                    left: px(left),
-                    top: y,
-                    right,
-                    bottom: y + row_height,
-                };
-                let remaining = (100.0 - window.utilization).clamp(0.0, 100.0);
-                let color = if remaining <= 10.0 {
-                    rgb(0xef5350)
-                } else if remaining <= 30.0 {
-                    rgb(if dark { 0xf5b84e } else { 0xb07d22 })
-                } else {
-                    foreground
-                };
-                let compact = settings.widget.compact_mode;
-                text(
-                    dc,
-                    label,
-                    line(
-                        if compact { 4.0 } else { 10.0 },
-                        px(if compact { 20.0 } else { 32.0 }),
-                    ),
-                    muted,
-                );
-                let track = RECT {
-                    left: px(if compact { 24.0 } else { 36.0 }),
-                    right: px(if compact { 54.0 } else { 102.0 }),
-                    top: y + row_height / 2 - px(3.0),
-                    bottom: y + row_height / 2 + px(3.0),
-                };
-                rounded(
-                    dc,
-                    track,
-                    px(3.0),
-                    rgb(if dark { 0x383b42 } else { 0xe6e7eb }),
-                );
-                let (start, end) = if window.stale {
-                    (0x888888, 0xaaaaaa)
-                } else if *label == "7d" {
-                    if dark {
-                        (0x9691bd, 0xc5b5dc)
-                    } else {
-                        (0x77729c, 0xb3a5c9)
-                    }
-                } else if dark {
-                    (0x6da5af, 0xa6c9bd)
-                } else {
-                    (0x467f88, 0x8bb6ad)
-                };
-                gradient(
-                    dc,
-                    RECT {
-                        right: track.left
-                            + ((track.right - track.left) as f32 * remaining / 100.0).round()
-                                as i32,
-                        ..track
-                    },
-                    px(3.0),
-                    start,
-                    end,
-                );
-                let estimate = if window.source == Source::Official {
-                    ""
-                } else {
-                    "估"
-                };
-                text(
-                    dc,
-                    &format!("{remaining:.0}%{estimate}"),
-                    line(
-                        if compact { 58.0 } else { 110.0 },
-                        px(if compact { 88.0 } else { 148.0 }),
-                    ),
-                    if remaining <= 30.0 { color } else { foreground },
-                );
-                text(
-                    dc,
-                    &reset_text(window, &settings.widget.reset_time_style, now, compact),
-                    line(
-                        if compact { 90.0 } else { 150.0 },
-                        rect.right - px(if compact { 4.0 } else { 8.0 }),
-                    ),
-                    muted,
-                );
-            }
-        }
-        SelectObject(dc, old_font);
-        let _ = DeleteObject(font.into());
-    }
-    let _ = BitBlt(
-        target,
-        0,
-        0,
-        rect.right,
-        rect.bottom,
-        Some(dc),
-        0,
-        0,
-        SRCCOPY,
-    );
-    SelectObject(dc, previous_bitmap);
-    let _ = DeleteObject(bitmap.into());
-    let _ = DeleteDC(dc);
+    BeginPaint(hwnd, &mut ps);
     let _ = EndPaint(hwnd, &ps);
+    if let Some(app) = APP.get() {
+        if let Err(error) = crate::taskbar_render::render(hwnd, app) {
+            tracing::warn!("native taskbar rendering failed, using visible fallback: {error}");
+            if let Some(request) = *REQUEST.lock() {
+                FAILED_PARENT.store(request.parent, Ordering::SeqCst);
+            }
+            disengage();
+            crate::window::reposition(app);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -756,16 +438,15 @@ mod tests {
             generated_at: chrono::Utc::now(),
             onboarding: false,
         };
-        for compact in [false, true] {
-            let actual = rows(Some(&payload), compact);
-            assert_eq!(actual.len(), 1);
-            assert_eq!(actual[0].0, "7d");
-            assert_eq!(actual[0].1.utilization, 37.0);
-        }
+        let actual = rows(Some(&payload));
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].0, "7d");
+        assert_eq!(actual[0].1.utilization, 37.0);
+        assert_eq!(compact_height(actual.len()), 22.0);
     }
 
     #[test]
-    fn compact_native_layout_selects_the_more_consumed_window() {
+    fn compact_native_layout_keeps_both_windows_and_sizes_two_capsules() {
         let mut provider = ProviderSnapshot::empty("codex", "Codex");
         provider.five_hour = Some(WindowSnapshot::official(12.0, None));
         provider.weekly = Some(WindowSnapshot::official(91.0, None));
@@ -774,8 +455,12 @@ mod tests {
             generated_at: chrono::Utc::now(),
             onboarding: false,
         };
-        assert_eq!(rows(Some(&payload), false).len(), 2);
-        assert_eq!(rows(Some(&payload), true)[0].0, "7d");
-        assert!(rows(None, false).is_empty());
+        let actual = rows(Some(&payload));
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].0, "5h");
+        assert_eq!(actual[1].0, "7d");
+        assert_eq!(compact_height(actual.len()), 38.0);
+        assert!(rows(None).is_empty());
+        assert_eq!(compact_height(0), 22.0);
     }
 }

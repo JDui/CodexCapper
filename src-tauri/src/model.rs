@@ -177,11 +177,12 @@ pub struct UsagePayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct AppearanceConfig {
     pub theme: String,
+    pub font_family: String,
     pub compact_mode: bool,
     pub show_model_weekly: bool,
     /// "float" or "taskbar".
     pub placement: String,
-    /// "absolute" or "countdown", how the widget prints a window's reset time.
+    /// "auto", "absolute" or "countdown", how reset time is printed.
     pub reset_time_style: String,
     pub resolved_theme: String,
 }

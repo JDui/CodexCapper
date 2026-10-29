@@ -68,6 +68,9 @@ pub const DEFAULT_PINNED_LOGICAL_H: f64 = 40.0;
 /// window that is invisible or takes over the screen.
 pub const MIN_LOGICAL_H: f64 = 24.0;
 pub const MAX_LOGICAL_H: f64 = 400.0;
+/// Compact placement shares one width; a sole quota gets a taller capsule.
+pub const COMPACT_LOGICAL_W: f64 = 132.0;
+pub const COMPACT_SINGLE_LOGICAL_H: f64 = 22.0;
 
 const MARGIN_X: f64 = 12.0;
 const MARGIN_Y: f64 = 8.0;
@@ -76,7 +79,7 @@ const MARGIN_Y: f64 = 8.0;
 /// content: label, gap, bar, gap, percentage, gap, bracketed reset time — so
 /// the time ends as far from the right edge as the label starts from the left.
 const TASKBAR_COLUMN_W: f64 = 224.0;
-const TASKBAR_COMPACT_COLUMN_W: f64 = 128.0;
+const TASKBAR_COMPACT_COLUMN_W: f64 = COMPACT_LOGICAL_W - TASKBAR_PADDING;
 const TASKBAR_COLUMN_GAP: f64 = 12.0;
 const TASKBAR_PADDING: f64 = 12.0;
 
@@ -273,8 +276,8 @@ pub fn target_position(
     compact: bool,
 ) -> (i32, i32, i32, i32) {
     let scale = monitor.scale();
-    let w = (if compact { 154.0 } else { LOGICAL_W } * scale).round() as i32;
-    let h = (logical_h.clamp(MIN_LOGICAL_H, MAX_LOGICAL_H) * scale).round() as i32;
+    let w = (if compact { COMPACT_LOGICAL_W } else { LOGICAL_W } * scale).round() as i32;
+    let h = (logical_h.clamp(if compact { COMPACT_SINGLE_LOGICAL_H } else { MIN_LOGICAL_H }, MAX_LOGICAL_H) * scale).round() as i32;
 
     let mut work = monitor.work;
 
@@ -792,7 +795,7 @@ pub fn appbar_plan(
     }
     let scale = monitor.scale();
     let w = (taskbar_width_logical(columns, compact) * scale).round() as i32;
-    let h = (height_logical.clamp(MIN_LOGICAL_H, MAX_LOGICAL_H) * scale).round() as i32;
+    let h = (height_logical.clamp(if compact { COMPACT_SINGLE_LOGICAL_H } else { MIN_LOGICAL_H }, MAX_LOGICAL_H) * scale).round() as i32;
     if w <= 0 || h <= 0 {
         return None;
     }
@@ -865,7 +868,7 @@ pub fn inrow_plan(
     let gap = (tray_gap_logical as f64 * scale).round() as i32;
     let w = (taskbar_width_logical(columns, compact) * scale).round() as i32;
     let band_h = bar.rect.height();
-    let content = (height_logical.clamp(MIN_LOGICAL_H, MAX_LOGICAL_H) * scale).round() as i32;
+    let content = (height_logical.clamp(if compact { COMPACT_SINGLE_LOGICAL_H } else { MIN_LOGICAL_H }, MAX_LOGICAL_H) * scale).round() as i32;
     // Never taller than the strip, so the widget reads as part of it; shorter
     // when the content is, so the strip stays clickable above and below.
     let h = band_h.min(content).max(1);
@@ -1505,6 +1508,20 @@ pub(crate) mod tests {
                 TASKBAR_PADDING + n * TASKBAR_COMPACT_COLUMN_W + (n - 1.0) * TASKBAR_COLUMN_GAP;
             assert_eq!(taskbar_width_logical(columns, true), plain);
         }
+    }
+
+    #[test]
+    fn compact_capsule_has_no_extra_minimum_height_in_any_placement() {
+        let monitor = lg();
+        let bar = measured(600, 1200);
+        for height in [22.0, 38.0] {
+            assert_eq!(target_position(&monitor, 0, 0, height, true).3, height as i32);
+            assert_eq!(target_position(&monitor, 0, 0, height, true).2, COMPACT_LOGICAL_W as i32);
+            assert_eq!(appbar_plan(&monitor, &bar, 8, 1, true, false, height).unwrap().rect.height(), height as i32);
+            assert_eq!(inrow_plan(&monitor, &bar, 8, 1, true, false, height).unwrap().height(), height as i32);
+        }
+        assert_eq!(target_position(&monitor, 0, 0, 18.0, false).3, MIN_LOGICAL_H as i32);
+        assert_eq!(taskbar_width_logical(1, true), COMPACT_LOGICAL_W);
     }
 
     /// Two providers are wider than one and three than two, whichever mode is

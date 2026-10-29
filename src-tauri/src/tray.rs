@@ -118,6 +118,8 @@ fn menu_signature(app: &AppHandle) -> String {
         s.providers.codex.enabled,
     );
     sig.push('|');
+    sig.push_str(crate::fonts::key(&s.appearance.font_family));
+    sig.push('|');
     sig.push_str(s.widget.monitor_stable_id.as_deref().unwrap_or("-"));
 
     // Only the identity of the attached monitors matters here. Their geometry
@@ -327,6 +329,14 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
                 .build(app)?,
         );
     }
+    appearance = appearance.separator();
+    for (key, label) in crate::fonts::OPTIONS {
+        appearance = appearance.item(
+            &CheckMenuItemBuilder::with_id(format!("font:{key}"), label)
+                .checked(crate::fonts::key(&s.appearance.font_family) == key)
+                .build(app)?,
+        );
+    }
     let appearance = appearance
         .separator()
         .item(
@@ -347,8 +357,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .separator()
         // How the widget prints a window's reset time after the percentage.
         .item(
+            &CheckMenuItemBuilder::with_id("tstyle:auto", "重置时间：自动切换")
+                .checked(!matches!(s.widget.reset_time_style.as_str(), "absolute" | "countdown"))
+                .build(app)?,
+        )
+        .item(
             &CheckMenuItemBuilder::with_id("tstyle:absolute", "重置时间：绝对时间")
-                .checked(s.widget.reset_time_style != "countdown")
+                .checked(s.widget.reset_time_style == "absolute")
                 .build(app)?,
         )
         .item(
@@ -480,6 +495,10 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                     .settings
                     .update(|s| s.appearance.theme = theme.clone());
                 needs_config = true;
+            } else if let Some(font) = other.strip_prefix("font:") {
+                let font = crate::fonts::key(font).to_string();
+                state.settings.update(|s| s.appearance.font_family = font);
+                needs_config = true;
             } else if let Some(mon_id) = other.strip_prefix("mon:") {
                 let mon_id = mon_id.to_string();
                 #[cfg(windows)]
@@ -513,6 +532,8 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     }
     if needs_config {
         let _ = app.emit("config", state.appearance());
+        #[cfg(windows)]
+        crate::taskbar_embed::refresh();
     }
     if needs_rebuild {
         rebuild(app);

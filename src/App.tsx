@@ -12,14 +12,15 @@ import type {
   UsagePayload,
   WindowSnapshot,
 } from "@/lib/types";
-import { formatClock, formatCompactCountdown, formatCountdown, formatSubscription, minutesSince, tickInterval } from "@/lib/utils";
+import { formatAbsoluteReset, formatClock, formatSubscription, formatUsageReset, minutesSince, tickInterval } from "@/lib/utils";
 
 const DEFAULT_APPEARANCE: AppearanceConfig = {
   theme: "system",
-  compact_mode: false,
+  font_family: "system",
+  compact_mode: true,
   show_model_weekly: false,
   placement: "float",
-  reset_time_style: "countdown",
+  reset_time_style: "auto",
   resolved_theme: "dark",
 };
 
@@ -48,6 +49,12 @@ export default function App() {
     document.documentElement.dataset.theme = appearance.resolved_theme;
   }, [appearance.resolved_theme]);
 
+  React.useEffect(() => {
+    document.documentElement.dataset.fontFamily =
+      appearance.font_family === "serif" || appearance.font_family === "mono"
+        ? appearance.font_family : "system";
+  }, [appearance.font_family]);
+
   const providers = React.useMemo(
     () => (payload?.providers ?? []).filter((p) => p.enabled),
     [payload],
@@ -70,6 +77,7 @@ export default function App() {
   // under an hour, without waiting for the next payload.
   React.useEffect(() => {
     let id = 0;
+    setNow(Date.now());
     const schedule = () => {
       const period = tickInterval(resetTimes, Date.now());
       id = window.setTimeout(() => {
@@ -208,6 +216,7 @@ export default function App() {
                   provider={p}
                   now={now}
                   resetTimeStyle={appearance.reset_time_style}
+                  compact={appearance.compact_mode}
                 />
               ))}
             </div>
@@ -290,7 +299,7 @@ interface GroupProps {
 }
 
 function ProviderGroup({ provider, now, resetTimeStyle, compact }: GroupProps) {
-  let rows = windowRows(provider);
+  const rows = windowRows(provider);
 
   // The rows themselves decide whether there is anything to draw, so the
   // provider can never end up as an empty box with a logo and no bars.
@@ -316,22 +325,19 @@ function ProviderGroup({ provider, now, resetTimeStyle, compact }: GroupProps) {
     );
   }
 
-  if (compact) {
-    // One row, the window closest to running out.
-    rows = rows
-      .slice(0, 2)
-      .reduce<WindowRow[]>(
-        (best, r) =>
-          best.length === 0 || (r.window?.utilization ?? -1) > (best[0].window?.utilization ?? -1)
-            ? [r]
-            : best,
-        [],
-      );
-  }
-
   return (
     <div className="cx-group">
-      {rows.map((r) => (
+      {rows.map((r) => compact ? (
+        <UsageCapsule
+          key={r.key}
+          label={r.label}
+          window={r.window}
+          provider={provider}
+          now={now}
+          resetTimeStyle={resetTimeStyle}
+          showLabel={rows.length > 1}
+        />
+      ) : (
         <Row
           key={r.key}
           label={r.label}
@@ -339,7 +345,6 @@ function ProviderGroup({ provider, now, resetTimeStyle, compact }: GroupProps) {
           provider={provider}
           now={now}
           resetTimeStyle={resetTimeStyle}
-          compact={compact}
           showCountdown
         />
       ))}
@@ -360,10 +365,12 @@ function ProviderColumn({
   provider,
   now,
   resetTimeStyle,
+  compact,
 }: {
   provider: ProviderSnapshot;
   now: number;
   resetTimeStyle: string;
+  compact: boolean;
 }) {
   const rows = windowRows(provider);
 
@@ -377,7 +384,17 @@ function ProviderColumn({
 
   return (
     <div className="cx-column">
-      {rows.map((r) => (
+      {rows.map((r) => compact ? (
+        <UsageCapsule
+          key={r.key}
+          label={r.label}
+          window={r.window}
+          provider={provider}
+          now={now}
+          resetTimeStyle={resetTimeStyle}
+          showLabel={rows.length > 1}
+        />
+      ) : (
         <Row
           key={r.key}
           label={r.label}
@@ -414,10 +431,9 @@ interface RowProps {
   now: number;
   resetTimeStyle: string;
   showCountdown: boolean;
-  compact?: boolean;
 }
 
-function Row({ label, window: w, provider, now, resetTimeStyle, showCountdown, compact = false }: RowProps) {
+function Row({ label, window: w, provider, now, resetTimeStyle, showCountdown }: RowProps) {
   const used = w?.utilization ?? 0;
   // The widget tracks what is left, not what was spent, the same way the
   // ChatGPT desktop shows it.
@@ -426,15 +442,7 @@ function Row({ label, window: w, provider, now, resetTimeStyle, showCountdown, c
   const est = w ? w.source !== "official" : true;
   const localOnly = w?.source === "estimate_local_only";
 
-  const resetMs = w?.resets_at ? new Date(w.resets_at).getTime() - now : null;
-  const resetText =
-    resetMs === null
-      ? null
-      : resetMs <= 0
-        ? compact ? "0m" : "即将重置"
-        : resetTimeStyle === "countdown"
-          ? compact ? formatCompactCountdown(resetMs) : formatCountdown(resetMs)
-          : formatReset(w!.resets_at!, resetMs);
+  const resetText = formatUsageReset(w?.resets_at ?? null, label, resetTimeStyle, now);
 
   const pctClass =
     remaining <= 10 ? "cx-danger" : remaining <= 30 ? "cx-warn" : undefined;
@@ -449,6 +457,78 @@ function Row({ label, window: w, provider, now, resetTimeStyle, showCountdown, c
       {showCountdown && resetText !== null && (
         <span className="cx-countdown cx-tabular">{resetText}</span>
       )}
+    </div>
+  );
+}
+
+/** Keep the single/dual target size unless actual rendered text needs less room. */
+function fitCapsuleText(node: HTMLElement): number {
+  const target = node.closest<HTMLElement>(".cx-capsule")?.dataset.single === "true" ? 12 : 11;
+  if (node.getBoundingClientRect().width <= 0) return target;
+  const range = document.createRange();
+  const overflow = () => Array.from(node.children).some((part) => {
+    range.selectNodeContents(part);
+    return range.getBoundingClientRect().width > part.getBoundingClientRect().width + 0.1;
+  });
+  const squeezeLabel = document.documentElement.dataset.fontFamily === "mono"
+    && node.closest<HTMLElement>(".cx-capsule")?.dataset.labeled === "true";
+  node.style.removeProperty("--capsule-gap");
+  for (const size of target === 12 ? [12, 11.5, 11, 10.5, 10] : [11, 10.5, 10]) {
+    node.style.setProperty("--capsule-font-size", `${size}px`);
+    if (!overflow()) return size;
+    if (squeezeLabel) {
+      node.style.setProperty("--capsule-gap", "1px");
+      if (!overflow()) return size;
+    }
+  }
+  return 10;
+}
+
+function UsageCapsule({ label, window: w, provider, now, resetTimeStyle, showLabel }: Omit<RowProps, "showCountdown"> & { showLabel: boolean }) {
+  const textRef = React.useRef<HTMLSpanElement>(null);
+  const used = w?.utilization ?? 0;
+  const remaining = Math.min(100, Math.max(0, 100 - used));
+  const reset = formatUsageReset(w?.resets_at ?? null, label, resetTimeStyle, now, true) ?? "--";
+  const estimate = !w || w.source === "official" ? "" : w.source === "estimate_local_only" ? "估*" : "估";
+  React.useLayoutEffect(() => {
+    const text = textRef.current;
+    if (!text) return;
+    const fit = () => { fitCapsuleText(text); };
+    fit();
+    const resize = new ResizeObserver(fit);
+    resize.observe(text);
+    const font = new MutationObserver(fit);
+    font.observe(document.documentElement, { attributes: true, attributeFilter: ["data-font-family"] });
+    document.fonts.addEventListener("loadingdone", fit);
+    return () => {
+      resize.disconnect();
+      font.disconnect();
+      document.fonts.removeEventListener("loadingdone", fit);
+    };
+  }, [label, showLabel, reset, estimate, Math.round(remaining)]);
+  if (!w) return null;
+  const content = <>
+    {showLabel && <span className="cx-capsule-label">{label}</span>}
+    <span className="cx-capsule-percent">{Math.round(remaining)}%{estimate}</span>
+    <span className="cx-capsule-reset">{reset}</span>
+  </>;
+  return (
+    <div
+      className="cx-capsule"
+      data-window={label}
+      data-stale={w.stale}
+      data-labeled={showLabel}
+      data-single={!showLabel}
+      role="progressbar"
+      aria-label={`${WINDOW_NAMES[label] ?? label}剩余额度`}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(remaining)}
+      aria-valuetext={`剩余 ${Math.round(remaining)}%${estimate}，重置 ${reset}`}
+      title={tooltip(provider, label, w, now, used, remaining)}
+    >
+      <div className="cx-capsule-track"><div className="cx-capsule-fill" style={{ width: `${remaining}%` }} /></div>
+      <span className="cx-capsule-text" ref={textRef}>{content}</span>
     </div>
   );
 }
@@ -485,8 +565,7 @@ function tooltip(
     lines.push(`消耗速率：${w.burn_rate.toFixed(1)}%/小时（估）`);
   if (w.eta) lines.push(`按当前速率，预计 ${formatClock(w.eta)} 达到上限（估）`);
   if (w.resets_at) {
-    const t = new Date(w.resets_at).getTime();
-    lines.push(`重置时间：${formatReset(w.resets_at, t - now)}`);
+    lines.push(`重置时间：${formatAbsoluteReset(w.resets_at, now)}`);
   }
   if (p.plan_type) lines.push(`订阅：${formatSubscription(p.plan_type)}`);
   if (p.extra_usage !== null && p.extra_usage > 0) lines.push(`额外用量：${p.extra_usage}`);
@@ -499,18 +578,6 @@ function tooltip(
   if (p.detail) lines.push(p.detail);
 
   return lines.join("\n");
-}
-
-/** Reset time as the row and the tooltip print it. A reset more than twelve
- * hours off is a date, not a clock time — [10-27] reads as the day it lands
- * on, and printing 14:42 for it only invites "which afternoon?". Inside
- * twelve hours it is worth knowing how near it is, so the minutes come back. */
-function formatReset(iso: string, resetMs: number): string {
-  if (resetMs > 12 * 3600_000) {
-    const d = new Date(iso);
-    return `${d.getMonth() + 1}-${d.getDate()}`;
-  }
-  return formatClock(iso);
 }
 
 function fmt(n: number): string {

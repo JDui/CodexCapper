@@ -3,16 +3,20 @@
 pub mod aggregator;
 pub mod appbar;
 pub mod autostart;
+pub mod fonts;
 #[cfg(not(windows))]
 pub mod fullscreen_x11;
 pub mod model;
 pub mod monitor;
 pub mod providers;
+pub mod reset_time;
 pub mod settings;
 pub mod shell;
 pub mod state;
 #[cfg(windows)]
 pub mod taskbar_embed;
+#[cfg(windows)]
+pub mod taskbar_render;
 #[cfg(windows)]
 pub mod taskbar_reservation;
 pub mod taskbar_layout;

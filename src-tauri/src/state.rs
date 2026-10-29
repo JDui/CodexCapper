@@ -64,6 +64,7 @@ impl AppState {
         AppearanceConfig {
             resolved_theme: theme::resolve(&s.appearance.theme).to_string(),
             theme: s.appearance.theme,
+            font_family: crate::fonts::key(&s.appearance.font_family).into(),
             compact_mode: s.widget.compact_mode,
             show_model_weekly: false,
             placement: s.widget.mode.clone(),
