@@ -11,6 +11,10 @@ pub mod providers;
 pub mod settings;
 pub mod shell;
 pub mod state;
+#[cfg(windows)]
+pub mod taskbar_embed;
+#[cfg(windows)]
+pub mod taskbar_reservation;
 pub mod taskbar_layout;
 pub mod theme;
 pub mod tray;
@@ -232,6 +236,11 @@ pub fn run() {
 
             tray::setup(&handle)?;
             autostart::sync(&handle, store.get().autostart);
+
+            #[cfg(windows)]
+            if let Err(error) = taskbar_embed::init(&handle) {
+                tracing::warn!("native taskbar host unavailable, using window placement: {error}");
+            }
 
             window::apply_ex_styles(&handle);
             window::reposition(&handle);

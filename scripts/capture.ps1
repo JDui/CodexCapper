@@ -26,20 +26,33 @@ namespace Cap {
     public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
     public delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder name, int max);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr target, int x, int y, int w, int h, IntPtr source, int sx, int sy, uint operation);
 
     public static IntPtr BiggestWindow(uint pid) {
       IntPtr best = IntPtr.Zero; long bestArea = 0;
-      EnumWindows((h, l) => {
+      EnumProc inspect = (h, l) => {
         uint p; GetWindowThreadProcessId(h, out p);
         if (p != pid || !IsWindowVisible(h)) return true;
         RECT r; if (!GetWindowRect(h, out r)) return true;
         long a = (long)(r.Right - r.Left) * (r.Bottom - r.Top);
         if (a > bestArea) { bestArea = a; best = h; }
+        return true;
+      };
+      EnumWindows((h, l) => {
+        inspect(h, l);
+        var name = new System.Text.StringBuilder(128);
+        GetClassName(h, name, name.Capacity);
+        if (name.ToString() == "Shell_TrayWnd" || name.ToString() == "Shell_SecondaryTrayWnd")
+          EnumChildWindows(h, inspect, IntPtr.Zero);
         return true;
       }, IntPtr.Zero);
       return best;
@@ -63,9 +76,11 @@ namespace Cap {
       } else {
         int x = r.Left - mx, y = r.Top - my;
         int w = (r.Right - r.Left) + mx * 2, hh = (r.Bottom - r.Top) + my * 2;
-        using (var bmp = new Bitmap(w, hh, PixelFormat.Format32bppArgb))
+        using (var bmp = new Bitmap(w, hh, PixelFormat.Format24bppRgb))
         using (var g = Graphics.FromImage(bmp)) {
-          g.CopyFromScreen(x, y, 0, 0, new Size(w, hh));
+          IntPtr source = GetDC(IntPtr.Zero), target = g.GetHdc();
+          try { BitBlt(target, 0, 0, w, hh, source, x, y, 0x40cc0020); } // SRCCOPY | CAPTUREBLT includes layered click-through children
+          finally { g.ReleaseHdc(target); ReleaseDC(IntPtr.Zero, source); }
           bmp.Save(outPath, ImageFormat.Png);
           return "ok region " + w + "x" + hh + " at " + x + "," + y;
         }
@@ -73,7 +88,7 @@ namespace Cap {
     }
   }
 }
-'@ -ReferencedAssemblies System.Drawing
+'@ -ReferencedAssemblies (@([System.Drawing.Bitmap].Assembly.Location, [System.Drawing.Size].Assembly.Location, 'System.Runtime', 'System.ComponentModel.Primitives') + @(Get-ChildItem -LiteralPath $PSHOME -Filter 'System.Private.Windows*.dll' | ForEach-Object FullName))
 }
 $p = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $p) { throw "process '$ProcessName' is not running" }

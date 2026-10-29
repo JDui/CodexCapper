@@ -17,11 +17,9 @@
 //! rectangle that cannot have a notch cut in it, so a strip 169px wide reserves
 //! the whole width of the display for its height — which is why
 //! `monitor::appbar_plan` sizes the row to the content rather than borrowing the
-//! taskbar's height. And the strip is beside the taskbar rather than inside its
-//! row: nothing third party can be placed inside that row on the modern
-//! taskbar, and the tools that fake it by parenting a window into
-//! `Shell_TrayWnd` bind their input queue to Explorer's and fall over whenever
-//! Explorer restarts.
+//! taskbar's height. This fallback strip is beside the taskbar. Normal
+//! placement uses `taskbar_embed`'s native child inside the taskbar, with its
+//! lifecycle timer hosted outside Explorer so it can recover after a restart.
 //!
 //! Nothing here hooks window messages. The shell posts `ABM_POSCHANGED` when the
 //! strips move, but the reconciler in `window` already compares a signature of
@@ -39,7 +37,7 @@ use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{HWND, RECT};
 #[cfg(windows)]
 use windows::Win32::UI::Shell::{
-    APPBARDATA, SHAppBarMessage, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, ABE_BOTTOM, ABE_TOP,
+    SHAppBarMessage, ABE_BOTTOM, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA,
 };
 
 /// The window handle the shell currently holds a registration for, or zero.
@@ -170,7 +168,10 @@ fn attempt(hwnd: isize, plan: &DockPlan, keep_out: &Rect, bounds: &Rect) -> Opti
             return None;
         }
 
-        let repeated = RESERVED.lock().replace(offered).is_some_and(|last| last == offered);
+        let repeated = RESERVED
+            .lock()
+            .replace(offered)
+            .is_some_and(|last| last == offered);
         if !repeated {
             tracing::info!(
                 "reserved a docked strip of {}x{} at {},{} along the {}",

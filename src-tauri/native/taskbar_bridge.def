@@ -1,0 +1,4 @@
+LIBRARY codexcapper-taskbar-bridge
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

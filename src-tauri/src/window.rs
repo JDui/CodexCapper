@@ -10,6 +10,33 @@ use crate::state::AppState;
 
 pub const WIDGET_LABEL: &str = "widget";
 
+fn native_taskbar_engaged() -> bool {
+    #[cfg(windows)]
+    {
+        crate::taskbar_embed::engaged()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn native_taskbar_visible() -> bool {
+    #[cfg(windows)]
+    {
+        crate::taskbar_embed::is_visible()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub(crate) fn wants_widget_visible(app: &AppHandle) -> bool {
+    app.state::<Arc<AppState>>().settings.get().widget.visible
+        && !AUTO_HIDDEN.load(Ordering::SeqCst)
+}
+
 /// Differences below this are compositor rounding, not a deliberate move.
 /// Persisting them would accumulate into visible drift across restarts.
 const OFFSET_NOISE_PX: i32 = 4;
@@ -181,12 +208,20 @@ fn release_strip(win: &tauri::WebviewWindow) {
 
 /// Takes the widget off screen, and with it the claim on the desktop.
 pub fn hide(win: &tauri::WebviewWindow) {
+    #[cfg(windows)]
+    {
+        crate::taskbar_reservation::release();
+        crate::taskbar_embed::hide();
+    }
     release_strip(win);
     let _ = win.hide();
 }
 
 /// The same, for callers that only hold the application handle.
 pub fn hide_widget(app: &AppHandle) {
+    app.state::<Arc<AppState>>()
+        .settings
+        .update(|s| s.widget.visible = false);
     if let Some(win) = widget(app) {
         hide(&win);
     }
@@ -197,6 +232,8 @@ pub fn hide_widget(app: &AppHandle) {
 /// process is reaped, and the shell's own cleanup of a dead window is not
 /// something to rely on for how the desktop looks the moment after quitting.
 pub fn release_dock(app: &AppHandle) {
+    #[cfg(windows)]
+    crate::taskbar_embed::shutdown();
     if let Some(win) = widget(app) {
         release_strip(&win);
     }
@@ -265,6 +302,12 @@ pub fn reposition(app: &AppHandle) {
         }
         let pinned = pinned && monitor::supports_panel_docking();
 
+        #[cfg(windows)]
+        if !pinned {
+            crate::taskbar_embed::disengage();
+            crate::taskbar_reservation::release();
+        }
+
         // Where a pinned widget goes, in the order the desktop allows. Inside
         // the row is the placement the user asked for and costs nobody any
         // screen; it is only trustworthy when the buttons were measured, so the
@@ -292,6 +335,42 @@ pub fn reposition(app: &AppHandle) {
                         s.widget.dock_left(),
                         pinned_height(),
                     );
+                    #[cfg(windows)]
+                    {
+                        if shown_by_choice {
+                            in_row = crate::taskbar_reservation::request(
+                                &bar,
+                                &mon,
+                                s.widget.compact_mode,
+                                s.widget.tray_gap,
+                                s.widget.dock_left(),
+                            )
+                            .or(in_row);
+                        } else {
+                            crate::taskbar_reservation::release();
+                        }
+                    }
+                    #[cfg(windows)]
+                    if let Some(mut rect) = in_row {
+                        // Native rendering has its own title and rows. A hidden
+                        // WebView's measured height does not describe them.
+                        let height = (if s.widget.compact_mode { 20.0 } else { 44.0 } * mon.scale())
+                            .round() as i32;
+                        let height = height.min(bar.rect.height()).max(1);
+                        rect.top = bar.rect.top + (bar.rect.height() - height) / 2;
+                        rect.bottom = rect.top + height;
+                        if crate::taskbar_embed::dock(bar.taskbar_hwnd, rect, shown_by_choice) {
+                            release_strip(&win);
+                            PINNED_STRIP.store(0, Ordering::SeqCst);
+                            // Only the native child paints in taskbar mode.
+                            // Keep the floating WebView alive for menus and IPC.
+                            let _ = win.hide();
+                            log_placement(true, true, false);
+                            return;
+                        }
+                    }
+                    #[cfg(windows)]
+                    crate::taskbar_embed::disengage();
                     if in_row.is_some() {
                         // Lying in the row is the whole arrangement: no ground
                         // is taken from the desktop, so none is held either.
@@ -305,13 +384,16 @@ pub fn reposition(app: &AppHandle) {
                         // strip now would take screen from the desktop for a
                         // question that is about to be answered — maximized
                         // windows resize for a reservation and then resize back
-                        // — so the widget stays hidden and waits instead. After
+                        // — so placement temporarily floats instead. After
                         // the grace the reservation is made regardless, because
                         // a shell that will not answer has to be worked around
                         // rather than waited for.
                         tracing::debug!("waiting for the strip to be measured");
-                        hide(&win);
-                        return;
+                        // Keep a visible floating fallback during the first
+                        // accessibility measurement. A hidden window cannot
+                        // measure its own content reliably on every WebView.
+                        release_strip(&win);
+                        None
                     } else {
                         reserved = reserve_strip(&win, &mon, &bar, &s, shown_by_choice);
                         if reserved.is_some() {
@@ -366,8 +448,10 @@ pub fn reposition(app: &AppHandle) {
                         s.widget.edge_offset_x,
                         s.widget.edge_offset_y,
                         logical_h,
+                        s.widget.compact_mode,
                     );
-                    let (x, y, w, h) = monitor::clamp_or_primary(tx, ty, w, h, logical_h);
+                    let (x, y, w, h) =
+                        monitor::clamp_or_primary(tx, ty, w, h, logical_h, s.widget.compact_mode);
 
                     // If the clamp had to step in, the stored offset is invalid and
                     // would keep producing the same wrong target.
@@ -385,7 +469,7 @@ pub fn reposition(app: &AppHandle) {
             },
         };
 
-        if pinned && shown_by_choice && !win.is_visible().unwrap_or(true) {
+        if shown_by_choice && !win.is_visible().unwrap_or(true) {
             let _ = win.show();
         }
 
@@ -476,13 +560,13 @@ fn finalize_move(app: &AppHandle) {
         return;
     }
 
-    let (base_x, base_y, _, _) = monitor::target_position(&mon, 0, 0, floating_height());
+    let state = app.state::<Arc<AppState>>();
+    let current = state.settings.get().widget;
+    let (base_x, base_y, _, _) =
+        monitor::target_position(&mon, 0, 0, floating_height(), current.compact_mode);
     let snap = |d: i32| if d.abs() < OFFSET_NOISE_PX { 0 } else { d };
     let offset_x = snap(base_x - pos.x);
     let offset_y = snap(base_y - pos.y);
-
-    let state = app.state::<Arc<AppState>>();
-    let current = state.settings.get().widget;
 
     // Sitting at the default corner of the primary display with no pin is not
     // worth recording, and pinning here would disable following the primary.
@@ -520,28 +604,32 @@ pub fn show_by_request(app: &AppHandle) {
 pub fn show(app: &AppHandle) {
     let Some(win) = widget(app) else { return };
     AUTO_HIDDEN.store(false, Ordering::SeqCst);
-    reposition(app);
-    let _ = win.show();
-    let _ = win.set_always_on_top(true);
-    apply_ex_styles(app);
     let state = app.state::<Arc<AppState>>();
+    state.settings.update(|s| s.widget.visible = true);
+    reposition(app);
+    if !native_taskbar_engaged() {
+        let _ = win.show();
+        let _ = win.set_always_on_top(true);
+    }
+    apply_ex_styles(app);
     // Deferred from startup and from any period the widget spent hidden: the
     // request is only safe against a window that has been realised.
     if state.settings.get().widget.click_through {
         let _ = win.set_ignore_cursor_events(true);
     }
-    state.settings.update(|s| s.widget.visible = true);
     crate::tray::rebuild(app);
     let _ = app.emit("config", state.appearance());
 }
 
 pub fn toggle_visibility(app: &AppHandle) {
     let Some(win) = widget(app) else { return };
-    if win.is_visible().unwrap_or(false) {
-        hide(&win);
+    // The floating WebView is intentionally hidden while the native child is
+    // shown. Visibility belongs to the user's preference, not that WebView.
+    if app.state::<Arc<AppState>>().settings.get().widget.visible {
         app.state::<Arc<AppState>>()
             .settings
             .update(|s| s.widget.visible = false);
+        hide(&win);
         crate::tray::rebuild(app);
     } else {
         show_by_request(app);
@@ -602,7 +690,7 @@ fn apply_fullscreen_hiding(app: &AppHandle, fullscreen: bool, stable_clear: bool
         stable_clear,
         shown_on_purpose: SHOWN_ON_PURPOSE.load(Ordering::SeqCst),
         auto_hidden: AUTO_HIDDEN.load(Ordering::SeqCst),
-        widget_on_screen: win.is_visible().unwrap_or(false),
+        widget_on_screen: win.is_visible().unwrap_or(false) || native_taskbar_visible(),
         visible_by_choice: s.widget.visible,
     };
     let action = decision.action();
@@ -627,8 +715,8 @@ fn apply_fullscreen_hiding(app: &AppHandle, fullscreen: bool, stable_clear: bool
                 fullscreen_window_description(),
                 FULLSCREEN_SOURCE.lock()
             );
-            hide(&win);
             AUTO_HIDDEN.store(true, Ordering::SeqCst);
+            hide(&win);
         }
         HideAction::Restore => {
             if decision.enabled {
@@ -637,8 +725,10 @@ fn apply_fullscreen_hiding(app: &AppHandle, fullscreen: bool, stable_clear: bool
                 tracing::info!("fullscreen hiding turned off, restoring the widget");
             }
             reposition(app);
-            let _ = win.show();
-            let _ = win.set_always_on_top(true);
+            if !native_taskbar_engaged() {
+                let _ = win.show();
+                let _ = win.set_always_on_top(true);
+            }
             apply_ex_styles(app);
         }
     }
@@ -789,6 +879,7 @@ static PLACEMENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new
 fn log_placement(pinned: bool, in_row: bool, reserved: bool) {
     let (mode, words) = match (pinned, in_row, reserved) {
         (false, _, _) => (1, "floating window"),
+        (true, true, _) if native_taskbar_engaged() => (5, "native child embedded in the taskbar"),
         (true, true, _) => (2, "inside the taskbar row"),
         (true, false, true) => (3, "in a strip reserved beside the taskbar"),
         (true, false, false) => (4, "over the taskbar, dodging its buttons"),
@@ -928,6 +1019,9 @@ fn covered_by_strip(hwnd: windows::Win32::Foundation::HWND, taskbar_hwnd: isize)
 /// the session, so anything covering it at all is a reason to come back up.
 #[cfg(windows)]
 fn ensure_on_top(app: &AppHandle) {
+    if native_taskbar_engaged() {
+        return;
+    }
     use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetAncestor, GetWindowRect, SetWindowPos, WindowFromPoint, GA_ROOT, HWND_TOPMOST,
@@ -1002,7 +1096,7 @@ fn reconcile_taskbar_visibility(app: &AppHandle) {
         return;
     }
     let Some(win) = widget(app) else { return };
-    if win.is_visible().unwrap_or(true) {
+    if win.is_visible().unwrap_or(true) || native_taskbar_visible() {
         return;
     }
 
@@ -1015,7 +1109,9 @@ fn reconcile_taskbar_visibility(app: &AppHandle) {
     {
         tracing::info!("taskbar strip is back, restoring the widget");
         reposition(app);
-        let _ = win.show();
+        if !native_taskbar_engaged() {
+            let _ = win.show();
+        }
     }
 }
 
@@ -1028,6 +1124,8 @@ fn reconcile_taskbar_visibility(app: &AppHandle) {
 /// that aborted the same way: the app could not be started again at all. The
 /// choice is remembered and `show` puts it back.
 pub fn set_click_through(app: &AppHandle, enabled: bool) {
+    #[cfg(windows)]
+    crate::taskbar_embed::refresh();
     let Some(win) = widget(app) else { return };
     if enabled && !win.is_visible().unwrap_or(false) {
         return;
@@ -1144,7 +1242,7 @@ fn topology_signature(app: &AppHandle) -> String {
                 // moment it has to move. Nothing else announces that — the work
                 // area and the strip itself stay exactly as they were.
                 Some(bar) => signature.push_str(&format!(
-                    "|tb:{},{},{},{}:{}:{}:sr{}:{}:ti{:?},{}",
+                    "|tb:{},{},{},{}:{}:{}:sr{}:{}:ti{:?},{}:hwnd{}",
                     bar.rect.left,
                     bar.rect.top,
                     bar.rect.right,
@@ -1154,7 +1252,8 @@ fn topology_signature(app: &AppHandle) -> String {
                     bar.start_right,
                     s.widget.dock_side,
                     bar.task_items_left,
-                    bar.task_items_right
+                    bar.task_items_right,
+                    bar.taskbar_hwnd
                 )),
                 None => signature.push_str("|tb:none"),
             }
@@ -1460,8 +1559,8 @@ fn foreground_covering_window(
     monitors: &[crate::monitor::MonitorInfo],
 ) -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetForegroundWindow, GetWindowLongPtrW, GetWindowTextW, GWL_EXSTYLE,
-        IsWindowVisible, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        GetClassNameW, GetForegroundWindow, GetWindowLongPtrW, GetWindowTextW, IsWindowVisible,
+        GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
     };
 
     unsafe {
@@ -1511,7 +1610,9 @@ fn foreground_covering_window(
             // fullscreen that was never there.
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             if ex & WS_EX_TRANSPARENT.0 as isize != 0 && ex & WS_EX_LAYERED.0 as isize != 0 {
-                sensor_note(format!("foreground {name}, a click-through overlay, ignored"));
+                sensor_note(format!(
+                    "foreground {name}, a click-through overlay, ignored"
+                ));
                 return None;
             }
 

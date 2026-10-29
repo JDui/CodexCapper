@@ -12,7 +12,7 @@ import type {
   UsagePayload,
   WindowSnapshot,
 } from "@/lib/types";
-import { formatClock, formatCountdown, minutesSince, tickInterval } from "@/lib/utils";
+import { formatClock, formatCompactCountdown, formatCountdown, formatSubscription, minutesSince, tickInterval } from "@/lib/utils";
 
 const DEFAULT_APPEARANCE: AppearanceConfig = {
   theme: "system",
@@ -124,7 +124,7 @@ export default function App() {
   }, []);
 
   const startDrag = React.useCallback((e: React.MouseEvent) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || (e.target instanceof Element && e.target.closest("button, a, .cx-link"))) return;
     getCurrentWindow()
       .startDragging()
       .catch(() => {});
@@ -157,7 +157,7 @@ export default function App() {
         parseFloat(barsStyle.paddingBottom) +
         parseFloat(shellStyle.borderTopWidth) +
         parseFloat(shellStyle.borderBottomWidth);
-      const needed = Math.ceil(content.getBoundingClientRect().height + frame);
+      const needed = Math.ceil(Math.max(content.scrollHeight, content.getBoundingClientRect().height) + frame);
       if (needed > 0 && needed !== last) {
         last = needed;
         invoke("set_content_height", { height: needed }).catch(() => {});
@@ -174,15 +174,30 @@ export default function App() {
     <div
       className={celebrating ? "cx-shell cx-celebrate" : "cx-shell"}
       data-placement={appearance.placement}
+      data-compact={appearance.compact_mode}
+      onMouseDown={!pinned && appearance.compact_mode ? startDrag : undefined}
       ref={shellRef}
     >
-      {!pinned && (
-        <div className="cx-grip" onMouseDown={startDrag} title="拖动">
-          <div className="cx-grip-dots" />
-        </div>
-      )}
       <div className="cx-bars">
         <div className="cx-content" ref={contentRef}>
+          {!pinned && !appearance.compact_mode && (
+            <div className="cx-header" onMouseDown={startDrag} title="拖动组件">
+              <span className="cx-title">{formatSubscription(providers[0]?.plan_type)}</span>
+              <button
+                className="cx-settings"
+                type="button"
+                aria-label="显示设置"
+                title="显示设置"
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={() => invoke("show_context_menu").catch(() => {})}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                  <path d="m9.5 3-.6 2.1-1.7 1-2.1-.5-2.5 4.3 1.5 1.6v2l-1.5 1.6 2.5 4.3 2.1-.5 1.7 1 .6 2.1h5l.6-2.1 1.7-1 2.1.5 2.5-4.3-1.5-1.6v-2l1.5-1.6-2.5-4.3-2.1.5-1.7-1L14.5 3z" />
+                  <circle cx="12" cy="12" r="3.2" />
+                </svg>
+              </button>
+            </div>
+          )}
           {payload?.onboarding ? (
             <Onboarding pinned={pinned} />
           ) : pinned ? (
@@ -208,6 +223,9 @@ export default function App() {
             ))
           )}
           {!payload && <div className="cx-status">加载中…</div>}
+          {payload && !payload.onboarding && providers.length === 0 && (
+            <div className="cx-status">尚未启用额度监测</div>
+          )}
         </div>
       </div>
     </div>
@@ -321,6 +339,7 @@ function ProviderGroup({ provider, now, resetTimeStyle, compact }: GroupProps) {
           provider={provider}
           now={now}
           resetTimeStyle={resetTimeStyle}
+          compact={compact}
           showCountdown
         />
       ))}
@@ -395,9 +414,10 @@ interface RowProps {
   now: number;
   resetTimeStyle: string;
   showCountdown: boolean;
+  compact?: boolean;
 }
 
-function Row({ label, window: w, provider, now, resetTimeStyle, showCountdown }: RowProps) {
+function Row({ label, window: w, provider, now, resetTimeStyle, showCountdown, compact = false }: RowProps) {
   const used = w?.utilization ?? 0;
   // The widget tracks what is left, not what was spent, the same way the
   // ChatGPT desktop shows it.
@@ -411,23 +431,23 @@ function Row({ label, window: w, provider, now, resetTimeStyle, showCountdown }:
     resetMs === null
       ? null
       : resetMs <= 0
-        ? "即将重置"
+        ? compact ? "0m" : "即将重置"
         : resetTimeStyle === "countdown"
-          ? formatCountdown(resetMs)
+          ? compact ? formatCompactCountdown(resetMs) : formatCountdown(resetMs)
           : formatReset(w!.resets_at!, resetMs);
 
   const pctClass =
     remaining <= 10 ? "cx-danger" : remaining <= 30 ? "cx-warn" : undefined;
 
   return (
-    <div className="cx-row" title={tooltip(provider, label, w, now, used, remaining)}>
+    <div className="cx-row" data-window={label} title={tooltip(provider, label, w, now, used, remaining)}>
       <span className="cx-label">{label}</span>
-      <UsageBar value={remaining} palette="codex" stale={stale} />
+      <UsageBar value={remaining} palette={label === "7d" ? "weekly" : "five-hour"} stale={stale} />
       <span className={`cx-pct cx-tabular ${pctClass ?? ""}`}>
         {Math.round(remaining)}%{est && <span className="cx-est">{localOnly ? "估*" : "估"}</span>}
       </span>
       {showCountdown && resetText !== null && (
-        <span className="cx-countdown cx-tabular">[{resetText}]</span>
+        <span className="cx-countdown cx-tabular">{resetText}</span>
       )}
     </div>
   );
@@ -468,7 +488,7 @@ function tooltip(
     const t = new Date(w.resets_at).getTime();
     lines.push(`重置时间：${formatReset(w.resets_at, t - now)}`);
   }
-  if (p.plan_type) lines.push(`套餐：${p.plan_type}`);
+  if (p.plan_type) lines.push(`订阅：${formatSubscription(p.plan_type)}`);
   if (p.extra_usage !== null && p.extra_usage > 0) lines.push(`额外用量：${p.extra_usage}`);
   if (p.tokens)
     lines.push(

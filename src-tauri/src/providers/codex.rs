@@ -176,11 +176,12 @@ impl CodexProvider {
         let mut stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
 
-        let write = |w: &mut std::process::ChildStdin, v: serde_json::Value| -> std::io::Result<()> {
-            w.write_all(serde_json::to_string(&v).unwrap_or_default().as_bytes())?;
-            w.write_all(b"\n")?;
-            w.flush()
-        };
+        let write =
+            |w: &mut std::process::ChildStdin, v: serde_json::Value| -> std::io::Result<()> {
+                w.write_all(serde_json::to_string(&v).unwrap_or_default().as_bytes())?;
+                w.write_all(b"\n")?;
+                w.flush()
+            };
 
         let ok = write(
             &mut stdin,
@@ -222,7 +223,10 @@ impl CodexProvider {
             let _ = tx.send(None);
         });
 
-        let out = rx.recv_timeout(std::time::Duration::from_secs(8)).ok().flatten();
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(8))
+            .ok()
+            .flatten();
         let _ = child.kill();
         let _ = child.wait();
         out
@@ -260,7 +264,10 @@ impl UsageProvider for CodexProvider {
     }
 
     fn watch_paths(&self) -> Vec<PathBuf> {
-        self.sessions_dir().into_iter().filter(|p| p.exists()).collect()
+        self.sessions_dir()
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect()
     }
 
     async fn poll(&mut self, _force: bool) -> ProviderSnapshot {
@@ -287,7 +294,10 @@ impl UsageProvider for CodexProvider {
         // timer tick, not just on a user request, so honouring it here meant a
         // process every poll interval for as long as the rollouts stayed stale,
         // which is exactly the case where they never stop being stale.
-        let cooled = self.next_app_server.map(|t| Utc::now() >= t).unwrap_or(true);
+        let cooled = self
+            .next_app_server
+            .map(|t| Utc::now() >= t)
+            .unwrap_or(true);
 
         let fresh = if rollout_stale && cooled {
             self.next_app_server = Some(Utc::now() + Duration::minutes(APP_SERVER_COOLDOWN_MINS));
@@ -308,14 +318,20 @@ impl UsageProvider for CodexProvider {
             *LAST_RAW.lock() = rate.raw.clone();
         }
 
+        self.snapshot(&rate, Utc::now())
+    }
+}
+
+impl CodexProvider {
+    /// Project the reported windows without requiring a five-hour window.
+    fn snapshot(&mut self, rate: &RateSnapshot, now: DateTime<Utc>) -> ProviderSnapshot {
         let mut snap = ProviderSnapshot::empty("codex", "Codex");
         snap.plan_type = rate.plan_type.clone();
         snap.tokens = rate.tokens;
 
-        let now = Utc::now();
         let age = now - rate.at;
 
-        let windows = ordered_windows(&rate);
+        let windows = ordered_windows(rate);
 
         for (i, w) in windows.iter().enumerate() {
             let label = window_label(w.minutes);
@@ -348,13 +364,21 @@ impl UsageProvider for CodexProvider {
                 utilization: if expired { 0.0 } else { w.used },
                 label,
                 resets_at: if expired { None } else { w.resets },
-                source: if expired { Source::Estimate } else { Source::Official },
+                source: if expired {
+                    Source::Estimate
+                } else {
+                    Source::Official
+                },
                 as_of: rate.at,
                 stale: age > span,
                 eta,
                 burn_rate: burn,
             };
-            if i == 0 {
+            // Weekly-only plans report their weekly window in `primary`.
+            // Keep the public fields meaningful as well as the visible label.
+            if snapshot.label.as_deref() == Some("7d") {
+                snap.weekly = Some(snapshot);
+            } else if snap.five_hour.is_none() {
                 snap.five_hour = Some(snapshot);
             } else {
                 snap.weekly = Some(snapshot);
@@ -375,7 +399,10 @@ impl UsageProvider for CodexProvider {
         };
 
         if snap.status == ProviderStatus::Stale {
-            snap.detail = Some(format!("快照已是 {} 分钟前的数据", age.num_minutes().max(0)));
+            snap.detail = Some(format!(
+                "快照已是 {} 分钟前的数据",
+                age.num_minutes().max(0)
+            ));
         }
         if self.settings.allow_http_fallback {
             // Left unimplemented on purpose: refreshing tokens over HTTP could
@@ -450,6 +477,16 @@ fn last_token_count(path: &std::path::Path, len: u64) -> Option<RateSnapshot> {
     None
 }
 
+/// Current app servers can return several independent limit buckets. Prefer
+/// Codex's bucket; an unrelated model's quota must never replace it.
+fn rate_limit_bucket(value: &serde_json::Value) -> &serde_json::Value {
+    field(value, &["rate_limits_by_limit_id", "rateLimitsByLimitId"])
+        .and_then(|buckets| buckets.get("codex"))
+        .filter(|bucket| !bucket.is_null())
+        .or_else(|| field(value, &["rate_limits", "rateLimits"]))
+        .unwrap_or(value)
+}
+
 /// Both reset shapes are accepted. `resets_in_seconds` is relative to the event
 /// timestamp, not to now, otherwise resumed sessions produce wrong countdowns.
 fn parse_rate_limits(
@@ -460,7 +497,7 @@ fn parse_rate_limits(
     if rate_limits.is_null() {
         return None;
     }
-    let root = field(rate_limits, &["rate_limits", "rateLimits"]).unwrap_or(rate_limits);
+    let root = rate_limit_bucket(rate_limits);
 
     let window = |key: &str| -> Option<CodexWindow> {
         let w = root.get(key)?;
@@ -468,6 +505,9 @@ fn parse_rate_limits(
             return None;
         }
         let used = field(w, &["used_percent", "usedPercent"])?.as_f64()?;
+        if !used.is_finite() {
+            return None;
+        }
         let resets = field(w, &["resets_at", "resetsAt"])
             .and_then(|x| x.as_i64())
             .and_then(epoch_to_utc)
@@ -477,7 +517,7 @@ fn parse_rate_limits(
                     .map(|s| at + Duration::seconds(s))
             });
         Some(CodexWindow {
-            used: used as f32,
+            used: used.clamp(0.0, 100.0) as f32,
             resets,
             minutes: field(w, &["window_minutes", "windowDurationMins"])
                 .and_then(|x| x.as_i64())
@@ -532,9 +572,8 @@ fn trusted_for(minutes: Option<i64>, slot: usize) -> Duration {
         .min(Duration::hours(MAX_FRESH_HOURS))
 }
 
-/// Shortest window first. The two fields on the snapshot are carriers, not
-/// claims: an account whose only limit is weekly puts that weekly window in the
-/// first one, and the label is what says so. Ordering by length also keeps the
+/// Shortest reported window first. An account whose only limit is weekly puts
+/// that weekly window in `primary`. Ordering by length also keeps the
 /// fast moving window on the top row, where it has always been for the accounts
 /// that have both.
 ///
@@ -655,6 +694,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn weekly_only_pro_survives_the_full_snapshot_projection() {
+        let now = Utc::now();
+        for slot in ["primary", "secondary"] {
+            for app_server in [false, true] {
+                let window = if app_server {
+                    serde_json::json!({ "usedPercent": 37.0, "windowDurationMins": 10080,
+                        "resetsAt": (now + Duration::days(3)).timestamp() })
+                } else {
+                    serde_json::json!({ "used_percent": 37.0, "window_minutes": 10080,
+                        "resets_at": (now + Duration::days(3)).timestamp() })
+                };
+                let mut raw = serde_json::json!({ "primary": null, "secondary": null, "plan_type": "prolite" });
+                raw[slot] = window;
+                let rate = parse_rate_limits(&raw, now, None).expect("one window is enough");
+                let snap = CodexProvider::new(CodexSettings::default()).snapshot(&rate, now);
+                assert!(snap.five_hour.is_none());
+                let weekly = snap.weekly.as_ref().expect("weekly row is retained");
+                assert_eq!(weekly.label.as_deref(), Some("7d"));
+                assert_eq!(weekly.utilization, 37.0);
+                assert_eq!(snap.status, ProviderStatus::Ok);
+                assert_eq!(snap.peak(), Some(37.0));
+            }
+        }
+    }
+
+    #[test]
+    fn named_codex_bucket_wins_over_a_missing_or_old_legacy_bucket() {
+        let raw = serde_json::json!({
+            "rateLimits": { "primary": { "usedPercent": 80, "windowDurationMins": 300 } },
+            "rateLimitsByLimitId": {
+                "codex": { "planType": "pro", "primary": null,
+                    "secondary": { "usedPercent": 19, "windowDurationMins": 10080 } },
+                "other": { "primary": { "usedPercent": 99, "windowDurationMins": 300 } }
+            }
+        });
+        let rate = parse_rate_limits(&raw, Utc::now(), None).expect("named bucket");
+        assert_eq!(rate.plan_type.as_deref(), Some("pro"));
+        assert!(rate.primary.is_none());
+        assert_eq!(rate.secondary.unwrap().used, 19.0);
+    }
+
+    #[test]
+    fn paired_windows_keep_their_semantic_slots_when_reversed() {
+        let now = Utc::now();
+        let rate = parse_rate_limits(&serde_json::json!({
+            "primary": { "used_percent": 83, "window_minutes": 10080 },
+            "secondary": { "used_percent": 12, "window_minutes": 300 }
+        }), now, None).unwrap();
+        let snap = CodexProvider::new(CodexSettings::default()).snapshot(&rate, now);
+        assert_eq!(snap.five_hour.unwrap().utilization, 12.0);
+        assert_eq!(snap.weekly.unwrap().utilization, 83.0);
+    }
+
+    #[test]
     fn parses_both_windows() {
         let v = serde_json::json!({
             "primary": { "used_percent": 5.0, "window_minutes": 300, "resets_at": 1781239950i64 },
@@ -676,7 +769,8 @@ mod tests {
         let at = DateTime::parse_from_rfc3339("2026-08-15T10:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let v = serde_json::json!({ "primary": { "used_percent": 20.0, "resets_in_seconds": 3600 } });
+        let v =
+            serde_json::json!({ "primary": { "used_percent": 20.0, "resets_in_seconds": 3600 } });
         let s = parse_rate_limits(&v, at, None).expect("parses");
         assert_eq!(s.primary.unwrap().resets.unwrap(), at + Duration::hours(1));
     }

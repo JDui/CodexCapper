@@ -47,7 +47,7 @@ const MONITORINFOF_PRIMARY: u32 = 1;
 /// Floating window width in logical pixels. The row is left aligned: the grip,
 /// a code label, a half-width bar, the percentage tight against the bar and a
 /// bracketed reset time — and nothing beyond it.
-pub const LOGICAL_W: f64 = 190.0;
+pub const LOGICAL_W: f64 = 236.0;
 
 /// Floating window height before the interface has measured itself. Two
 /// providers with two windows each. It is deliberately not the tallest case:
@@ -75,7 +75,8 @@ const MARGIN_Y: f64 = 8.0;
 /// Width of one provider column when pinned to the taskbar. Exactly the
 /// content: label, gap, bar, gap, percentage, gap, bracketed reset time — so
 /// the time ends as far from the right edge as the label starts from the left.
-const TASKBAR_COLUMN_W: f64 = 157.0;
+const TASKBAR_COLUMN_W: f64 = 224.0;
+const TASKBAR_COMPACT_COLUMN_W: f64 = 128.0;
 const TASKBAR_COLUMN_GAP: f64 = 12.0;
 const TASKBAR_PADDING: f64 = 12.0;
 
@@ -269,9 +270,10 @@ pub fn target_position(
     offset_x: i32,
     offset_y: i32,
     logical_h: f64,
+    compact: bool,
 ) -> (i32, i32, i32, i32) {
     let scale = monitor.scale();
-    let w = (LOGICAL_W * scale).round() as i32;
+    let w = (if compact { 154.0 } else { LOGICAL_W } * scale).round() as i32;
     let h = (logical_h.clamp(MIN_LOGICAL_H, MAX_LOGICAL_H) * scale).round() as i32;
 
     let mut work = monitor.work;
@@ -309,7 +311,7 @@ pub fn target_position(
 
 /// Guarantees the window keeps at least half of its area on a work area,
 /// falling back to the primary corner when it would not.
-pub fn clamp_or_primary(x: i32, y: i32, w: i32, h: i32, logical_h: f64) -> (i32, i32, i32, i32) {
+pub fn clamp_or_primary(x: i32, y: i32, w: i32, h: i32, logical_h: f64, compact: bool) -> (i32, i32, i32, i32) {
     let area = (w as i64) * (h as i64);
     if area <= 0 {
         return (x, y, w, h);
@@ -325,7 +327,7 @@ pub fn clamp_or_primary(x: i32, y: i32, w: i32, h: i32, logical_h: f64) -> (i32,
         return (x, y, w, h);
     }
     match primary() {
-        Some(p) => target_position(&p, 0, 0, logical_h),
+        Some(p) => target_position(&p, 0, 0, logical_h, compact),
         None => (x, y, w, h),
     }
 }
@@ -385,11 +387,9 @@ pub fn monitor_at(x: i32, y: i32) -> Option<MonitorInfo> {
 
 /// Taskbar geometry.
 ///
-/// The taskbar window is only ever read. Pinned placement reserves a strip of
-/// its own beside it — see `appbar_plan` and `crate::appbar` — and the overlay
-/// that `taskbar_position` produces as a fallback is an ordinary top level
-/// window. Neither reparents into the taskbar or moves anything it owns, so
-/// both survive an Explorer restart.
+/// Native placement creates a child inside this window without moving
+/// shell-owned controls. A reserved strip remains the fallback when the
+/// measured buttons leave no room for the child.
 #[derive(Debug, Clone, Copy)]
 pub struct TaskbarInfo {
     pub rect: Rect,
@@ -672,7 +672,8 @@ pub fn taskbar_width_logical(columns: usize, compact: bool) -> f64 {
         TASKBAR_COLUMN_BONUS.get(count - 1).copied().unwrap_or(0.0)
     };
     let n = count as f64;
-    TASKBAR_PADDING + n * (TASKBAR_COLUMN_W + bonus) + (n - 1.0) * TASKBAR_COLUMN_GAP
+    let column = if compact { TASKBAR_COMPACT_COLUMN_W } else { TASKBAR_COLUMN_W };
+    TASKBAR_PADDING + n * (column + bonus) + (n - 1.0) * TASKBAR_COLUMN_GAP
 }
 
 /// Pinned into the strip, centred in its height. `left` picks the end: the
@@ -1480,7 +1481,7 @@ pub(crate) mod tests {
     #[test]
     fn a_lone_provider_is_exactly_what_it_shows() {
         let alone = taskbar_width_logical(1, false);
-        assert_eq!(alone, taskbar_width_logical(1, true));
+        assert!(alone > taskbar_width_logical(1, true));
         assert_eq!(alone, TASKBAR_PADDING + TASKBAR_COLUMN_W);
         let pair = taskbar_width_logical(2, false);
         assert_eq!(pair - alone, TASKBAR_COLUMN_W + TASKBAR_COLUMN_GAP);
@@ -1491,11 +1492,7 @@ pub(crate) mod tests {
     #[test]
     fn a_full_strip_is_no_wider_than_it_has_always_been() {
         for columns in 3..=6 {
-            assert_eq!(
-                taskbar_width_logical(columns, false),
-                taskbar_width_logical(columns, true),
-                "{columns} columns claimed extra room"
-            );
+            assert!(taskbar_width_logical(columns, false) > taskbar_width_logical(columns, true));
         }
     }
 
@@ -1505,7 +1502,7 @@ pub(crate) mod tests {
         for columns in 1..=4 {
             let n = columns.max(1) as f64;
             let plain =
-                TASKBAR_PADDING + n * TASKBAR_COLUMN_W + (n - 1.0) * TASKBAR_COLUMN_GAP;
+                TASKBAR_PADDING + n * TASKBAR_COMPACT_COLUMN_W + (n - 1.0) * TASKBAR_COLUMN_GAP;
             assert_eq!(taskbar_width_logical(columns, true), plain);
         }
     }
