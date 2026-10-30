@@ -1,4 +1,4 @@
-# CodexCapper 2.1.0
+# CodexCapper 2.1.1
 
 Codex 额度桌面组件。用进度条实时显示 Codex 账号每个额度窗口（5 小时 / 每周）的剩余比例和距重置的倒计时，可以悬浮在桌面上，也可以嵌进 Windows 任务栏常驻，一眼看到额度还剩多少。
 
@@ -53,10 +53,10 @@ Codex 额度桌面组件。用进度条实时显示 Codex 账号每个额度窗�
 
 ## 下载与安装
 
-前往 [v2.0.0 Release](https://github.com/JDui/CodexCapper/releases/tag/v2.0.0) 下载：
+前往 [v2.1.1 Release](https://github.com/JDui/CodexCapper/releases/tag/v2.1.1) 下载：
 
-- [Windows x64 安装包](https://github.com/JDui/CodexCapper/releases/download/v2.0.0/CodexCapper_2.0.0_x64-setup.exe)：当前用户安装，无需管理员权限。
-- [Windows x64 便携版](https://github.com/JDui/CodexCapper/releases/download/v2.0.0/CodexCapper-2.0.0-win-x64-portable.zip)：解压后运行 `codexcapper.exe`，无需安装。
+- [Windows x64 安装包](https://github.com/JDui/CodexCapper/releases/download/v2.1.1/CodexCapper_2.1.1_x64-setup.exe)：当前用户安装，无需管理员权限。
+- [Windows x64 便携版](https://github.com/JDui/CodexCapper/releases/download/v2.1.1/CodexCapper-2.1.1-win-x64-portable.zip)：解压后运行 `codexcapper.exe`，无需安装。
 
 首次运行后组件默认嵌在任务栏右端、紧贴托盘图标；想改成悬浮窗口，右键系统托盘里的 CodexCapper 图标，在「位置」菜单里切换即可。
 
@@ -118,6 +118,16 @@ Windows 11 的标签区由 XAML 绘制，进程外移动普通窗口无法为它
 - `scripts/` 下有文档截图的重拍脚本
 
 任务栏布局验证：`scripts/verify-reservation.ps1 -RequireApplied` 独立检查实际容量缩小量和确认代数；`scripts/verify-taskbar.ps1` 检查原生父子窗口、分层绘制和可见性。2026-10-29 在 Windows 11 26200 上完成拥挤标签验证：当时预留 195 物理像素后，标签容器有效宽度由 5120 降为 4925；填满到 25 个标签时，常见标签宽度由 175 降为 166。结束进程后，预留边距自动恢复。
+
+开始菜单稳定性验证：在任务栏模式运行后，执行 `scripts/verify-taskbar-stability.ps1`，会反复打开 Win+X 菜单并检查组件保持嵌入、悬浮窗口未出现、进程仍存活。多屏环境下也保留暂时无法测量的任务栏缓存；只有实际移除的任务栏才清除缓存。可用 `-RightClickStart` 检查开始按钮的右键操作；Win11 的 XAML 开始按钮通过 UI Automation 定位，操作后恢复鼠标位置。
+
+排查自动退出时，日志位于 `%APPDATA%\CodexCapper\logs\`，记录启动路径、进程 ID 和正常退出原因。Rust 崩溃会写入 `last-crash.txt`（含线程与堆栈）。被外部强制终止或发生原生崩溃时，Rust 异常处理程序可能没有机会运行。
+
+## 2.1.1 更新
+
+- 改善开始菜单等系统菜单打开时的任务栏稳定性，并保留多显示器暂时无法测量的布局。
+- 图形更新暂时失败时自动重试，多次失败后使用兼容显示并定时恢复。
+- 增加启动、退出和崩溃诊断日志，以及任务栏稳定性检查脚本。
 
 ## 2.1.0 更新
 

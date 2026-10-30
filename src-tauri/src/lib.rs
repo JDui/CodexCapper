@@ -105,7 +105,10 @@ fn install_panic_hook() {
             return;
         }
 
-        tracing::error!("panic at {location}: {message}");
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!("panic on {thread_name} at {location}: {message}\n{backtrace}");
 
         // Written separately because the tracing appender may not flush before
         // the process aborts.
@@ -114,10 +117,11 @@ fn install_panic_hook() {
         let _ = std::fs::write(
             path,
             format!(
-                "{}\nCodexCapper {} on {}\nup {}s\npanic at {location}\n{message}\n",
+                "{}\nCodexCapper {} on {}\npid {} up {}s\nthread {thread_name}\npanic at {location}\n{message}\n{backtrace}\n",
                 chrono::Utc::now().to_rfc3339(),
                 env!("CARGO_PKG_VERSION"),
                 desktop(),
+                std::process::id(),
                 uptime_secs(),
             ),
         );
@@ -195,6 +199,12 @@ pub fn run() {
     let _ = STARTED_AT.set(std::time::Instant::now());
     init_logging();
     install_panic_hook();
+    tracing::info!(
+        "starting CodexCapper {}: pid={}, executable={:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        std::env::current_exe().ok()
+    );
 
     let mut builder = tauri::Builder::default();
 
@@ -305,7 +315,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to start the application")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 // Hiding the last window must not end the process, but a
                 // deliberate quit has to get through. Preventing this
                 // unconditionally made the Exit menu item do nothing at all.
@@ -316,7 +326,13 @@ pub fn run() {
                 // toolkit with "cannot move state from Destroyed", which lands
                 // in the crash report as if something had gone wrong during an
                 // otherwise orderly shutdown.
-                let torn_down = session_ending() || window::widget(app).is_none();
+                let ending = session_ending();
+                let missing_widget = window::widget(app).is_none();
+                let torn_down = ending || missing_widget;
+                tracing::info!(
+                    "exit requested: pid={}, up={}s, code={code:?}, quitting={}, session_ending={ending}, widget_missing={missing_widget}",
+                    std::process::id(), uptime_secs(), state::is_quitting()
+                );
                 if !state::is_quitting() && !torn_down {
                     api.prevent_exit();
                 } else {
@@ -326,6 +342,8 @@ pub fn run() {
                     // the tray, the watchdog and a sign out all land here.
                     window::release_dock(app);
                 }
+            } else if let tauri::RunEvent::Exit = event {
+                tracing::info!("event loop exited: pid={}, up={}s", std::process::id(), uptime_secs());
             }
         });
 }

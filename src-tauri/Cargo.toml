@@ -1,6 +1,6 @@
 [package]
 name = "codexcapper"
-version = "2.1.0"
+version = "2.1.1"
 description = "Desktop widget for Codex usage windows"
 authors = ["JDui"]
 license = "GPL-3.0-or-later"

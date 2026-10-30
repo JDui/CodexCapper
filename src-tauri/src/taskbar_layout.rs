@@ -83,6 +83,21 @@ pub fn cluster(taskbar_hwnd: isize) -> Option<Cluster> {
         .map(|(_, found)| *found)
 }
 
+/// A failed query belongs to one strip. A successful query of another monitor
+/// must not erase its last answer (Explorer stops answering UIA during Win+X).
+fn update_measurements(
+    previous: &[(isize, Cluster)],
+    fresh: impl IntoIterator<Item = (isize, Option<Cluster>)>,
+) -> Vec<(isize, Cluster)> {
+    fresh
+        .into_iter()
+        .filter_map(|(hwnd, measured)| {
+            let held = previous.iter().find(|(was, _)| *was == hwnd).map(|(_, c)| c);
+            measured.map(|c| settle(held, c)).or(held.copied()).map(|c| (hwnd, c))
+        })
+        .collect()
+}
+
 /// Starts the thread that keeps the measurements current.
 ///
 /// The reconciler cannot ask this question itself: a UI Automation call is a
@@ -106,14 +121,14 @@ pub fn spawn() {
 
 #[cfg(windows)]
 fn survey() {
-    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
     use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
 
-    // The UI Automation client is an in process COM object and wants an
-    // apartment to live in. This thread is that apartment, once, and nothing
-    // else in the process is asked to host COM on the shell's behalf.
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    // UIA requires a dedicated MTA thread without windows or an STA message
+    // pump. In particular, shell menus must not hold up our UI thread.
+    if let Err(error) = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok() {
+        tracing::warn!("taskbar accessibility initialization failed: {error}");
+        return;
     }
 
     let mut automation: Option<IUIAutomation> = None;
@@ -135,22 +150,11 @@ fn survey() {
 fn refresh(client: &windows::Win32::UI::Accessibility::IUIAutomation) {
     use crate::monitor::taskbar_windows;
 
-    let mut found: Vec<(isize, Cluster)> = Vec::new();
     let previous = MEASURED.lock().clone();
-    for hwnd in taskbar_windows() {
-        if let Some(cluster) = measure(client, hwnd) {
-            let key = hwnd.0 as isize;
-            let kept = previous.iter().find(|(was, _)| *was == key).map(|(_, c)| c);
-            found.push((key, settle(kept, cluster)));
-        }
-    }
-
-    // Strips that will not answer keep whatever was last said about them.
-    // Publishing an empty list here would tell every caller the taskbar is
-    // empty, which is the one answer that leads to covering the buttons.
-    if found.is_empty() {
-        return;
-    }
+    let found = update_measurements(
+        &previous,
+        taskbar_windows().into_iter().map(|hwnd| (hwnd.0 as isize, measure(client, hwnd))),
+    );
     let mut held = MEASURED.lock();
     if *held != found {
         for (hwnd, cluster) in &found {
@@ -291,5 +295,25 @@ mod tests {
     #[test]
     fn an_unmeasured_strip_is_asked_about_rather_than_assumed_empty() {
         assert!(cluster(0).is_none());
+    }
+
+    #[test]
+    fn a_shell_menu_on_one_monitor_does_not_discard_its_cached_layout() {
+        let primary = Cluster { left: 1080, right: 4216 };
+        let secondary = Cluster { left: 2228, right: 3376 };
+        let previous = [(1, primary), (2, secondary)];
+        let updated = update_measurements(&previous, [(1, None), (2, Some(secondary))]);
+        assert_eq!(updated, previous);
+        assert_eq!(update_measurements(&updated, [(1, None), (2, None)]), previous);
+    }
+
+    #[test]
+    fn removed_strips_are_forgotten_and_new_strips_require_a_measurement() {
+        let primary = Cluster { left: 1080, right: 4216 };
+        let previous = [(1, primary), (2, primary)];
+        assert_eq!(update_measurements(&previous, [(1, None), (3, None)]), vec![(1, primary)]);
+        assert!(update_measurements(&previous, []).is_empty());
+        let changed = Cluster { left: 1080, right: 4400 };
+        assert_eq!(update_measurements(&previous, [(1, Some(changed))]), vec![(1, changed)]);
     }
 }

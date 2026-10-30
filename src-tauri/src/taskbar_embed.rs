@@ -5,8 +5,10 @@
 //! message-only window outlives the taskbar child, so Explorer replacing its
 //! window cannot take the recovery timer with it.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
 use windows::core::w;
@@ -24,10 +26,71 @@ const SYNC: u32 = WM_APP + 41;
 static APP: OnceLock<AppHandle> = OnceLock::new();
 static MANAGER: AtomicIsize = AtomicIsize::new(0);
 static CHILD: AtomicIsize = AtomicIsize::new(0);
-static FAILED_PARENT: AtomicIsize = AtomicIsize::new(0);
+static HEALTH: parking_lot::Mutex<HostHealth> = parking_lot::Mutex::new(HostHealth::new());
+static SYNC_PENDING: AtomicBool = AtomicBool::new(false);
 static ENGAGED: AtomicBool = AtomicBool::new(false);
 static ROW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static REQUEST: parking_lot::Mutex<Option<Placement>> = parking_lot::Mutex::new(None);
+
+const RETRY_DELAY: Duration = Duration::from_secs(10);
+
+struct HostHealth {
+    parent: isize,
+    failures: u8,
+    retry_after: Option<Instant>,
+}
+
+impl HostHealth {
+    const fn new() -> Self {
+        Self { parent: 0, failures: 0, retry_after: None }
+    }
+
+    fn allow(&mut self, parent: isize, now: Instant) -> bool {
+        if self.parent != parent || self.retry_after.is_some_and(|after| now >= after) {
+            *self = Self::new();
+            self.parent = parent;
+        }
+        self.retry_after.is_none()
+    }
+
+    fn failed(&mut self, parent: isize, now: Instant) -> bool {
+        if self.parent != parent {
+            *self = Self::new();
+            self.parent = parent;
+        }
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= 3 {
+            self.retry_after = Some(now + RETRY_DELAY);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn retry_due(&self, now: Instant) -> bool {
+        self.retry_after.is_some_and(|after| now >= after)
+    }
+}
+
+thread_local! {
+    static UI_BUSY: Cell<bool> = const { Cell::new(false) };
+}
+
+// COM may pump messages while a drawing factory is being initialized. Never
+// reenter placement/drawing with a RefCell borrow or native surface in flight.
+struct UiWork;
+
+impl UiWork {
+    fn enter() -> Option<Self> {
+        UI_BUSY.with(|busy| if busy.replace(true) { None } else { Some(Self) })
+    }
+}
+
+impl Drop for UiWork {
+    fn drop(&mut self) {
+        UI_BUSY.with(|busy| busy.set(false));
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Placement {
@@ -88,7 +151,7 @@ pub fn init(app: &AppHandle) -> windows::core::Result<()> {
 /// Queue placement without making an async provider or reconciler thread own
 /// a native window. Failure leaves the existing visible fallback available.
 pub fn dock(parent: isize, rect: Rect, visible: bool) -> bool {
-    if MANAGER.load(Ordering::SeqCst) == 0 || FAILED_PARENT.load(Ordering::SeqCst) == parent {
+    if MANAGER.load(Ordering::SeqCst) == 0 || !HEALTH.lock().allow(parent, Instant::now()) {
         ENGAGED.store(false, Ordering::SeqCst);
         return false;
     }
@@ -104,9 +167,11 @@ pub fn dock(parent: isize, rect: Rect, visible: bool) -> bool {
 
 fn wake() {
     let manager = MANAGER.load(Ordering::SeqCst);
-    if manager != 0 {
+    if manager != 0 && !SYNC_PENDING.swap(true, Ordering::SeqCst) {
         unsafe {
-            let _ = PostMessageW(Some(handle(manager)), SYNC, WPARAM(0), LPARAM(0));
+            if PostMessageW(Some(handle(manager)), SYNC, WPARAM(0), LPARAM(0)).is_err() {
+                SYNC_PENDING.store(false, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -247,32 +312,45 @@ unsafe fn apply() -> windows::core::Result<()> {
 unsafe extern "system" fn manager_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
         SYNC => {
+            SYNC_PENDING.store(false, Ordering::SeqCst);
+            let Some(_work) = UiWork::enter() else { return LRESULT(0) };
             if let Err(error) = apply() {
-                if let Some(request) = *REQUEST.lock() {
-                    FAILED_PARENT.store(request.parent, Ordering::SeqCst);
+                let request = *REQUEST.lock();
+                let fallback = request.is_some_and(|r| HEALTH.lock().failed(r.parent, Instant::now()));
+                tracing::warn!("native taskbar update failed (fallback={fallback}): {error}");
+                if fallback {
+                    disengage();
+                    destroy_child();
+                    if let Some(app) = APP.get() {
+                        crate::window::reposition(app);
+                    }
                 }
-                disengage();
-                destroy_child();
-                tracing::warn!("native taskbar child failed, using visible fallback: {error}");
-                if let Some(app) = APP.get() {
-                    crate::window::reposition(app);
-                }
+                // One transient graphics error leaves the last bitmap visible.
+                // The independent timer retries; repeated failures use a timed
+                // fallback rather than blacklisting this taskbar forever.
+            } else if engaged() && is_visible() {
+                *HEALTH.lock() = HostHealth::new();
             }
             LRESULT(0)
         }
         WM_TIMER => {
+            let Some(_work) = UiWork::enter() else { return LRESULT(0) };
             if let Some(app) = APP.get() {
-                if !crate::window::wants_widget_visible(app)
-                    || !app
+                let wants_host = crate::window::wants_widget_visible(app)
+                    && app
                         .state::<Arc<AppState>>()
                         .settings
                         .get()
                         .widget
-                        .taskbar_mode()
-                {
+                        .taskbar_mode();
+                if !wants_host {
                     crate::taskbar_reservation::release();
                 }
                 if crate::taskbar_reservation::heartbeat() {
+                    crate::window::reposition(app);
+                }
+                let retry_due = HEALTH.lock().retry_due(Instant::now());
+                if wants_host && !engaged() && retry_due {
                     crate::window::reposition(app);
                 }
                 if engaged() {
@@ -301,8 +379,8 @@ unsafe extern "system" fn manager_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                             0,
                             SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
                         );
-                        let _ = InvalidateRect(Some(child), None, false);
                     }
+                    wake();
                 }
             }
             LRESULT(0)
@@ -412,22 +490,40 @@ unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     BeginPaint(hwnd, &mut ps);
     let _ = EndPaint(hwnd, &ps);
-    if let Some(app) = APP.get() {
-        if let Err(error) = crate::taskbar_render::render(hwnd, app) {
-            tracing::warn!("native taskbar rendering failed, using visible fallback: {error}");
-            if let Some(request) = *REQUEST.lock() {
-                FAILED_PARENT.store(request.parent, Ordering::SeqCst);
-            }
-            disengage();
-            crate::window::reposition(app);
-        }
-    }
+    // The lifecycle manager owns rendering. A nested WM_PAINT during a COM
+    // call only validates the region and cannot recursively initialize COM.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{ProviderSnapshot, UsagePayload};
+
+    #[test]
+    fn transient_graphics_failures_retry_and_repeated_failures_have_a_cooldown() {
+        let now = Instant::now();
+        let mut health = HostHealth::new();
+        assert!(health.allow(1, now));
+        assert!(!health.failed(1, now));
+        assert!(!health.failed(1, now));
+        assert!(health.failed(1, now));
+        assert!(!health.allow(1, now + Duration::from_secs(9)));
+        assert!(!health.retry_due(now + Duration::from_secs(9)));
+        assert!(health.retry_due(now + RETRY_DELAY));
+        assert!(health.allow(1, now + RETRY_DELAY));
+        assert!(!health.failed(1, now + RETRY_DELAY));
+        assert!(health.allow(2, now));
+        assert_eq!(health.failures, 0);
+    }
+
+    #[test]
+    fn native_ui_work_cannot_reenter_while_com_pumps_messages() {
+        let work = UiWork::enter().expect("first native update");
+        assert!(UiWork::enter().is_none());
+        assert!(UiWork::enter().is_none());
+        drop(work);
+        assert!(UiWork::enter().is_some());
+    }
 
     #[test]
     fn weekly_only_is_visible_in_both_native_layouts() {
